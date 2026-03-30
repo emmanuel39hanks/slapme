@@ -1,10 +1,10 @@
 import Foundation
 import Combine
-import IOKit
-import IOKit.hid
 import AVFoundation
 
-/// Detects physical slaps/taps using microphone (primary) or accelerometer (if root).
+/// Detects physical slaps using the microphone.
+/// Uses a dual-threshold system: absolute peak + spike ratio above ambient.
+/// Typing and gentle touches are filtered out aggressively.
 final class MotionEngine: ObservableObject {
     @Published var currentForce: Double = 0.0
     @Published var isDetecting: Bool = false
@@ -17,8 +17,13 @@ final class MotionEngine: ObservableObject {
     private var audioEngine: AVAudioEngine?
     private var cooldownActive = false
     private var comboResetTimer: Timer?
-    private var ambientLevel: Float = 0.0
-    private var ambientSamples: [Float] = []
+
+    // Ambient noise tracking
+    private var ambientPeaks: [Float] = []
+    private let ambientWindowSize = 80
+
+    // Typing filter: track recent small peaks
+    private var recentPeakTimes: [Date] = []
 
     struct ForceEvent {
         let force: Double
@@ -42,10 +47,20 @@ final class MotionEngine: ObservableObject {
 
     func startDetection(settings: SettingsManager) {
         guard !isDetecting else { return }
-        NSLog("[MotionEngine] Starting detection...")
+        NSLog("[MotionEngine] Starting mic detection...")
 
-        // Go straight to microphone — it works on all Macs without root
-        startMicrophoneDetection(settings: settings)
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            beginMicDetection(settings: settings)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                if granted {
+                    DispatchQueue.main.async { self?.beginMicDetection(settings: settings) }
+                }
+            }
+        default:
+            NSLog("[MotionEngine] Mic access denied")
+        }
     }
 
     func stopDetection() {
@@ -56,48 +71,17 @@ final class MotionEngine: ObservableObject {
         comboResetTimer?.invalidate()
     }
 
-    // MARK: - Microphone Detection
-
-    private func startMicrophoneDetection(settings: SettingsManager) {
-        NSLog("[MotionEngine] Requesting mic permission...")
-
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            NSLog("[MotionEngine] Mic already authorized")
-            beginMicDetection(settings: settings)
-        case .notDetermined:
-            NSLog("[MotionEngine] Mic not determined, requesting...")
-            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-                NSLog("[MotionEngine] Mic permission result: %@", granted ? "granted" : "denied")
-                if granted {
-                    DispatchQueue.main.async {
-                        self?.beginMicDetection(settings: settings)
-                    }
-                }
-            }
-        case .denied:
-            NSLog("[MotionEngine] Mic DENIED — user needs to enable in System Settings > Privacy")
-        case .restricted:
-            NSLog("[MotionEngine] Mic RESTRICTED")
-        @unknown default:
-            NSLog("[MotionEngine] Mic unknown status")
-        }
-    }
+    // MARK: - Mic
 
     private func beginMicDetection(settings: SettingsManager) {
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
 
-        NSLog("[MotionEngine] Mic format: sr=%.0f ch=%d", format.sampleRate, format.channelCount)
+        guard format.sampleRate > 0, format.channelCount > 0 else { return }
 
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            NSLog("[MotionEngine] ERROR: Invalid mic format")
-            return
-        }
-
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.processMicBuffer(buffer, settings: settings)
+        inputNode.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
+            self?.processBuffer(buffer, settings: settings)
         }
 
         do {
@@ -107,64 +91,83 @@ final class MotionEngine: ObservableObject {
                 self.detectionMethod = "Microphone"
                 self.isDetecting = true
             }
-            NSLog("[MotionEngine] Mic detection STARTED")
+            NSLog("[MotionEngine] Mic started (sr=%.0f ch=%d)", format.sampleRate, format.channelCount)
         } catch {
-            NSLog("[MotionEngine] ERROR starting mic: %@", error.localizedDescription)
+            NSLog("[MotionEngine] Mic error: %@", error.localizedDescription)
         }
     }
 
-    private func processMicBuffer(_ buffer: AVAudioPCMBuffer, settings: SettingsManager) {
+    private func processBuffer(_ buffer: AVAudioPCMBuffer, settings: SettingsManager) {
         guard let channelData = buffer.floatChannelData?[0] else { return }
-        let frameLength = Int(buffer.frameLength)
-        guard frameLength > 0 else { return }
+        let len = Int(buffer.frameLength)
+        guard len > 0 else { return }
 
-        // Calculate peak amplitude
+        // Find peak amplitude
         var peak: Float = 0
-        var sumSquares: Float = 0
-        for i in 0..<frameLength {
+        for i in 0..<len {
             let s = abs(channelData[i])
-            sumSquares += s * s
             if s > peak { peak = s }
         }
-        let rms = sqrt(sumSquares / Float(frameLength))
 
-        // Update ambient baseline
-        ambientSamples.append(rms)
-        if ambientSamples.count > 60 { ambientSamples.removeFirst() }
-        ambientLevel = ambientSamples.reduce(0, +) / Float(ambientSamples.count)
+        // Update ambient peak baseline (rolling average of peaks)
+        ambientPeaks.append(peak)
+        if ambientPeaks.count > ambientWindowSize { ambientPeaks.removeFirst() }
 
-        // Spike detection
-        let spikeRatio = ambientLevel > 0.0001 ? peak / ambientLevel : peak / 0.001
-        let sensitivityMult = Float(0.3 + settings.sensitivity * 0.7)
-        let threshold: Float = 3.0 / sensitivityMult
+        // Need enough samples to calibrate
+        guard ambientPeaks.count >= 20 else { return }
 
-        guard spikeRatio > threshold else {
-            // Decay force
+        // Ambient level: use the median of recent peaks (robust to outliers)
+        let sorted = ambientPeaks.sorted()
+        let ambientMedian = sorted[sorted.count / 2]
+
+        // ─── DUAL THRESHOLD ───
+        // 1. Absolute minimum peak: must be loud enough to be a physical impact
+        //    Typing is usually < 0.05, slaps are > 0.1
+        let absoluteThreshold: Float = 0.08 / Float(0.5 + settings.sensitivity * 0.5)
+
+        // 2. Relative spike: must be significantly above ambient
+        let spikeRatio = ambientMedian > 0.0001 ? peak / ambientMedian : 0
+        let relativeThreshold: Float = 5.0 / Float(0.5 + settings.sensitivity * 0.5)
+
+        // Both must be met
+        let isImpact = peak > absoluteThreshold && spikeRatio > relativeThreshold
+
+        // ─── TYPING FILTER ───
+        // Typing creates many rapid small-to-medium peaks. A real slap is a single
+        // sharp transient followed by silence. If we see many peaks in quick
+        // succession, it's typing — ignore.
+        let now = Date()
+        if peak > absoluteThreshold * 0.5 {
+            recentPeakTimes.append(now)
+        }
+        recentPeakTimes = recentPeakTimes.filter { now.timeIntervalSince($0) < 0.5 }
+
+        // If more than 4 peaks in 500ms, it's typing
+        let isTyping = recentPeakTimes.count > 4
+
+        // Decay force display
+        if !isImpact {
             DispatchQueue.main.async {
-                if self.currentForce > 0.01 { self.currentForce *= 0.85 }
+                if self.currentForce > 0.01 { self.currentForce *= 0.8 }
                 else { self.currentForce = 0 }
             }
             return
         }
 
+        guard !isTyping else { return }
         guard !cooldownActive else { return }
 
-        // Normalize
-        let maxRatio = threshold * 4.0
-        let force = Double(min(1.0, max(0.0, (spikeRatio - threshold) / (maxRatio - threshold))))
+        // Normalize force
+        let maxRatio = relativeThreshold * 4.0
+        let force = Double(min(1.0, max(0.1, (spikeRatio - relativeThreshold) / (maxRatio - relativeThreshold))))
 
-        // Typing protection
-        if settings.typingProtection && force < 0.15 {
-            return
-        }
-
-        NSLog("[MotionEngine] SLAP DETECTED! force=%.2f spikeRatio=%.1f", force, spikeRatio)
+        NSLog("[MotionEngine] SLAP! force=%.2f peak=%.3f ratio=%.1f ambient=%.4f", force, peak, spikeRatio, ambientMedian)
 
         let event = ForceEvent(
             force: force,
             category: ForceCategory(force: force),
-            timestamp: Date(),
-            raw: SIMD3<Double>(Double(peak), Double(rms), Double(spikeRatio))
+            timestamp: now,
+            raw: SIMD3<Double>(Double(peak), Double(ambientMedian), Double(spikeRatio))
         )
 
         DispatchQueue.main.async {
@@ -172,12 +175,12 @@ final class MotionEngine: ObservableObject {
             self.lastEventTimestamp = event.timestamp
             self.comboCount += 1
             self.forceEvent.send(event)
-            self.startCooldown(interval: settings.cooldownInterval)
+            self.startCooldown(interval: max(0.5, settings.cooldownInterval))
             self.resetComboAfterDelay()
         }
     }
 
-    // MARK: - Cooldown & Combo
+    // MARK: - Cooldown
 
     private func startCooldown(interval: Double) {
         cooldownActive = true
@@ -203,14 +206,12 @@ final class MotionEngine: ObservableObject {
             timestamp: Date(),
             raw: SIMD3<Double>(normalized, 0, 0)
         )
-
         DispatchQueue.main.async {
             self.currentForce = normalized
             self.lastEventTimestamp = event.timestamp
             self.comboCount += 1
             self.forceEvent.send(event)
         }
-
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.currentForce = 0
         }

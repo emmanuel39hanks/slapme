@@ -70,6 +70,9 @@ final class ReactionEngine: ObservableObject {
         // Play sound
         sound.play(force: event.force, volumeScale: settings.volumeScale)
 
+        // Show slap overlay with random phrase
+        SlapOverlayManager.shared.showSlap(force: event.force)
+
         // Apply visual effect
         applyVisualEffect(visual)
 

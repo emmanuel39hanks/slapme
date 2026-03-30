@@ -41,9 +41,9 @@ final class SoundEngine: ObservableObject {
         // Build all candidate paths — order matters, first match wins
         var searchPaths: [URL] = []
 
-        // 1. .app bundle: Contents/Resources/<bundle>/SoundPacks/default
-        //    This is where Bundle.main.resourceURL points in a proper .app
+        // 1. .app bundle: Contents/Resources/Sounds/ (flat directory)
         if let resURL = Bundle.main.resourceURL {
+            searchPaths.append(resURL.appendingPathComponent("Sounds"))
             searchPaths.append(resURL.appendingPathComponent("\(bundleName)/\(subPath)"))
             searchPaths.append(resURL.appendingPathComponent(subPath))
         }

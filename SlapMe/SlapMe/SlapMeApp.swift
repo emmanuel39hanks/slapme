@@ -1,5 +1,6 @@
 import SwiftUI
 import AVFoundation
+import Combine
 
 @main
 struct SlapMeApp: App {
@@ -18,6 +19,7 @@ struct SlapMeApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover!
+    private var cancellables = Set<AnyCancellable>()
 
     let settingsManager = SettingsManager()
     let motionEngine = MotionEngine()
@@ -27,11 +29,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        // Request mic permission immediately
-        AVCaptureDevice.requestAccess(for: .audio) { granted in
-            print("[SlapMe] Microphone access: \(granted ? "granted" : "denied")")
-        }
-
         // Wire up engines
         reactionEngine = ReactionEngine(
             settings: settingsManager,
@@ -40,21 +37,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         soundEngine.preloadCurrentPack(settings: settingsManager)
-
-        // Start detection!
         reactionEngine.start()
 
-        // Menu bar
+        // Menu bar with slap count
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
         if let button = statusItem?.button {
             button.image = NSImage(systemSymbolName: "hand.raised.fill", accessibilityDescription: "SlapMe")
+            button.title = " 0"
+            button.imagePosition = .imageLeading
             button.action = #selector(togglePopover)
             button.target = self
         }
 
+        // Update menu bar count when slaps happen
+        settingsManager.$totalSlaps
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] count in
+                self?.statusItem?.button?.title = " \(count)"
+            }
+            .store(in: &cancellables)
+
         let popover = NSPopover()
-        popover.contentSize = NSSize(width: 280, height: 440)
+        popover.contentSize = NSSize(width: 280, height: 480)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(
             rootView: MenuBarView()
@@ -64,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         self.popover = popover
 
-        print("[SlapMe] App launched, detection started")
+        NSLog("[SlapMe] App launched, detection started")
     }
 
     @objc private func togglePopover() {
