@@ -2,28 +2,54 @@ import Foundation
 import AVFoundation
 import Combine
 
-/// High-performance sound engine with preloading and force-based selection.
-/// Uses AVAudioEngine for low-latency playback (<100ms).
+/// Sound engine that lets users pick a specific sound to play on slap.
+/// Uses AVAudioEngine for low-latency playback.
 final class SoundEngine: ObservableObject {
     // MARK: - Published
-    @Published var loadedPack: SoundPack?
     @Published var isPlaying: Bool = false
-    @Published var availablePacks: [SoundPackMeta] = []
+    @Published var availableSounds: [SoundItem] = []
+    @Published var selectedSound: String = "" {
+        didSet {
+            UserDefaults.standard.set(selectedSound, forKey: "selectedSound")
+            preloadSelected()
+        }
+    }
 
     // MARK: - Audio
     private let audioEngine = AVAudioEngine()
-    private var playerNodes: [AVAudioPlayerNode] = []
-    private var preloadedBuffers: [ForceRange: [AVAudioPCMBuffer]] = [:]
-    private let maxConcurrentPlayers = 4
-    private var currentPlayerIndex = 0
+    private var playerNode = AVAudioPlayerNode()
+    private var selectedBuffer: AVAudioPCMBuffer?
+    private var engineFormat: AVAudioFormat!
 
-    // MARK: - Types
+    struct SoundItem: Identifiable, Hashable {
+        let id: String      // filename
+        let name: String    // display name
+        let path: URL
+    }
 
+    // Kept for API compat with ReactionEngine
+    struct SoundPack: Codable {
+        let name: String
+        let author: String
+        let version: String
+        let description: String
+        let sounds: SoundCategories
+    }
+    struct SoundCategories: Codable {
+        let soft: [String]
+        let medium: [String]
+        let hard: [String]
+    }
+    struct SoundPackMeta: Identifiable {
+        let id: String
+        let name: String
+        let author: String
+        let description: String
+        let path: URL
+    }
+    var availablePacks: [SoundPackMeta] { [] }
     enum ForceRange: String, CaseIterable {
-        case soft = "soft"
-        case medium = "medium"
-        case hard = "hard"
-
+        case soft, medium, hard
         init(force: Double) {
             switch force {
             case 0..<0.3: self = .soft
@@ -33,298 +59,178 @@ final class SoundEngine: ObservableObject {
         }
     }
 
-    struct SoundPack: Codable {
-        let name: String
-        let author: String
-        let version: String
-        let description: String
-        let sounds: SoundCategories
-    }
-
-    struct SoundCategories: Codable {
-        let soft: [String]
-        let medium: [String]
-        let hard: [String]
-    }
-
-    struct SoundPackMeta: Identifiable {
-        let id: String  // folder name
-        let name: String
-        let author: String
-        let description: String
-        let path: URL
-    }
-
     // MARK: - Init
 
     init() {
         setupAudioEngine()
-        scanAvailablePacks()
+        scanSounds()
+        selectedSound = UserDefaults.standard.string(forKey: "selectedSound") ?? ""
     }
 
-    private var engineFormat: AVAudioFormat!
-
     private func setupAudioEngine() {
-        let mainMixer = audioEngine.mainMixerNode
-        let output = audioEngine.outputNode
-
-        // Use a standard stereo format for all connections and buffers
         engineFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)
-            ?? output.inputFormat(forBus: 0)
+            ?? audioEngine.outputNode.inputFormat(forBus: 0)
 
-        // Create player node pool for concurrent playback
-        for _ in 0..<maxConcurrentPlayers {
-            let player = AVAudioPlayerNode()
-            audioEngine.attach(player)
-            audioEngine.connect(player, to: mainMixer, format: engineFormat)
-            playerNodes.append(player)
-        }
+        audioEngine.attach(playerNode)
+        audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: engineFormat)
 
         do {
             try audioEngine.start()
         } catch {
-            print("[SoundEngine] Failed to start audio engine: \(error)")
+            print("[SoundEngine] Failed to start: \(error)")
         }
     }
 
-    // MARK: - Pack Management
+    // MARK: - Scan sounds
 
-    func scanAvailablePacks() {
-        var packs: [SoundPackMeta] = []
+    func scanSounds() {
+        var items: [SoundItem] = []
 
-        // SPM resource bundle (Bundle.module)
-        let moduleSoundPacks = Bundle.module.resourceURL?.appendingPathComponent("SoundPacks")
-        if let path = moduleSoundPacks {
-            print("[SoundEngine] Scanning SPM bundle: \(path.path)")
-            packs.append(contentsOf: scanPacksAt(path))
+        // Find all mp3/wav files in the default sound pack
+        let searchPaths: [URL?] = [
+            Bundle.module.resourceURL?.appendingPathComponent("SoundPacks/default"),
+            Bundle.main.resourceURL?.appendingPathComponent("SoundPacks/default"),
+        ]
+
+        for basePath in searchPaths.compactMap({ $0 }) {
+            guard let files = try? FileManager.default.contentsOfDirectory(
+                at: basePath, includingPropertiesForKeys: nil
+            ) else { continue }
+
+            for file in files {
+                let ext = file.pathExtension.lowercased()
+                guard ext == "mp3" || ext == "wav" || ext == "m4a" else { continue }
+
+                let filename = file.lastPathComponent
+                let displayName = file.deletingPathExtension().lastPathComponent
+                    .replacingOccurrences(of: "_", with: " ")
+                    .capitalized
+
+                if !items.contains(where: { $0.id == filename }) {
+                    items.append(SoundItem(id: filename, name: displayName, path: file))
+                }
+            }
         }
 
-        // Also check main bundle (Xcode builds)
-        if let mainPath = Bundle.main.resourceURL?.appendingPathComponent("SoundPacks") {
-            packs.append(contentsOf: scanPacksAt(mainPath))
-        }
-
-        // Check Application Support for user packs
-        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            let userPacksDir = appSupport.appendingPathComponent("SlapMe/SoundPacks")
-            packs.append(contentsOf: scanPacksAt(userPacksDir))
-        }
-
-        if packs.isEmpty {
-            print("[SoundEngine] WARNING: No sound packs found, using synthesized fallback")
-            packs.append(SoundPackMeta(
-                id: "default",
-                name: "Default",
-                author: "SlapMe",
-                description: "Synthesized fallback sounds",
-                path: Bundle.module.resourceURL ?? Bundle.main.resourceURL ?? URL(fileURLWithPath: "/")
-            ))
-        }
-
-        print("[SoundEngine] Found \(packs.count) sound pack(s): \(packs.map(\.name))")
+        print("[SoundEngine] Found \(items.count) sounds: \(items.map(\.name))")
 
         DispatchQueue.main.async {
-            self.availablePacks = packs
-        }
-    }
-
-    private func scanPacksAt(_ directory: URL) -> [SoundPackMeta] {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
-            at: directory, includingPropertiesForKeys: nil
-        ) else { return [] }
-
-        return contents.compactMap { url -> SoundPackMeta? in
-            let metaURL = url.appendingPathComponent("metadata.json")
-            guard let data = try? Data(contentsOf: metaURL),
-                  let pack = try? JSONDecoder().decode(SoundPack.self, from: data) else {
-                return nil
+            self.availableSounds = items
+            // Auto-select first sound if none selected
+            if self.selectedSound.isEmpty, let first = items.first {
+                self.selectedSound = first.id
             }
-            return SoundPackMeta(
-                id: url.lastPathComponent,
-                name: pack.name,
-                author: pack.author,
-                description: pack.description,
-                path: url
-            )
         }
     }
 
-    // MARK: - Preloading
+    // MARK: - Preload
+
+    private func preloadSelected() {
+        guard let item = availableSounds.first(where: { $0.id == selectedSound }) else {
+            print("[SoundEngine] Sound '\(selectedSound)' not found")
+            return
+        }
+        selectedBuffer = loadBuffer(from: item.path)
+        print("[SoundEngine] Preloaded: \(item.name) (\(selectedBuffer != nil ? "OK" : "FAILED"))")
+    }
 
     func preloadCurrentPack(settings: SettingsManager) {
-        let packId = settings.selectedSoundPack
-        print("[SoundEngine] Preloading pack: \(packId)")
-
-        // Find pack path
-        guard let meta = availablePacks.first(where: { $0.id == packId }) else {
-            print("[SoundEngine] Pack '\(packId)' not found in \(availablePacks.map(\.id)), using fallback")
-            preloadDefaultSounds()
-            return
+        // Compat shim — just preload selected
+        if selectedSound.isEmpty, let first = availableSounds.first {
+            selectedSound = first.id
         }
-
-        let metaURL = meta.path.appendingPathComponent("metadata.json")
-        print("[SoundEngine] Loading metadata from: \(metaURL.path)")
-
-        guard let data = try? Data(contentsOf: metaURL),
-              let pack = try? JSONDecoder().decode(SoundPack.self, from: data) else {
-            print("[SoundEngine] Failed to load metadata.json, using fallback")
-            preloadDefaultSounds()
-            return
-        }
-
-        loadedPack = pack
-        preloadedBuffers.removeAll()
-
-        // Preload each category
-        preloadedBuffers[.soft] = pack.sounds.soft.compactMap {
-            let url = meta.path.appendingPathComponent($0)
-            let buf = loadBuffer(from: url)
-            print("[SoundEngine] Load \($0): \(buf != nil ? "OK" : "FAILED") (\(url.path))")
-            return buf
-        }
-        preloadedBuffers[.medium] = pack.sounds.medium.compactMap {
-            let url = meta.path.appendingPathComponent($0)
-            let buf = loadBuffer(from: url)
-            print("[SoundEngine] Load \($0): \(buf != nil ? "OK" : "FAILED")")
-            return buf
-        }
-        preloadedBuffers[.hard] = pack.sounds.hard.compactMap {
-            let url = meta.path.appendingPathComponent($0)
-            let buf = loadBuffer(from: url)
-            print("[SoundEngine] Load \($0): \(buf != nil ? "OK" : "FAILED")")
-            return buf
-        }
-
-        let total = preloadedBuffers.values.reduce(0) { $0 + $1.count }
-        print("[SoundEngine] Preloaded \(total) sound buffers")
+        preloadSelected()
     }
 
-    private func preloadDefaultSounds() {
-        // Generate synthesized sounds matching the engine format (stereo)
-        for range in ForceRange.allCases {
-            let buffer = generateToneBuffer(
-                format: engineFormat,
-                frequency: range == .soft ? 440 : range == .medium ? 660 : 880,
-                duration: range == .soft ? 0.1 : range == .medium ? 0.2 : 0.3,
-                amplitude: range == .soft ? 0.3 : range == .medium ? 0.6 : 1.0
-            )
-            if let buffer {
-                preloadedBuffers[range] = [buffer]
-            }
-        }
-    }
+    // MARK: - Load buffer
 
     private func loadBuffer(from url: URL) -> AVAudioPCMBuffer? {
-        guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
+        guard let audioFile = try? AVAudioFile(forReading: url) else {
+            print("[SoundEngine] Can't read: \(url.lastPathComponent)")
+            return nil
+        }
 
-        // If file format matches engine format, load directly
+        // Convert to engine format if needed
         if audioFile.processingFormat.channelCount == engineFormat.channelCount
             && audioFile.processingFormat.sampleRate == engineFormat.sampleRate {
             let frameCount = AVAudioFrameCount(audioFile.length)
             guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) else {
                 return nil
             }
-            do {
-                try audioFile.read(into: buffer)
-                return buffer
-            } catch {
-                return nil
-            }
+            try? audioFile.read(into: buffer)
+            return buffer
         }
 
-        // Convert to engine format
         guard let converter = AVAudioConverter(from: audioFile.processingFormat, to: engineFormat) else {
             return nil
         }
         let ratio = engineFormat.sampleRate / audioFile.processingFormat.sampleRate
         let outputFrameCount = AVAudioFrameCount(Double(audioFile.length) * ratio)
-        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: outputFrameCount) else {
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: outputFrameCount),
+              let inputBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: AVAudioFrameCount(audioFile.length)) else {
             return nil
         }
 
-        let inputBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: AVAudioFrameCount(audioFile.length))!
-        do {
-            try audioFile.read(into: inputBuffer)
-        } catch {
-            return nil
-        }
-
+        try? audioFile.read(into: inputBuffer)
         var error: NSError?
         converter.convert(to: outputBuffer, error: &error) { _, outStatus in
             outStatus.pointee = .haveData
             return inputBuffer
         }
-
         return error == nil ? outputBuffer : nil
     }
 
-    private func generateToneBuffer(
-        format: AVAudioFormat,
-        frequency: Double,
-        duration: Double,
-        amplitude: Double
-    ) -> AVAudioPCMBuffer? {
-        let sampleRate = format.sampleRate
-        let frameCount = AVAudioFrameCount(sampleRate * duration)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
-        buffer.frameLength = frameCount
+    // MARK: - Play
 
-        guard let channelData = buffer.floatChannelData else { return nil }
-        let channelCount = Int(format.channelCount)
-
-        for frame in 0..<Int(frameCount) {
-            let t = Double(frame) / sampleRate
-            let envelope = exp(-t * 10.0)
-            let sample = Float(sin(2.0 * .pi * frequency * t) * amplitude * envelope)
-            // Write to all channels (mono or stereo)
-            for ch in 0..<channelCount {
-                channelData[ch][frame] = sample
-            }
+    /// Play the selected sound
+    func playSelected(volume: Float = 1.0) {
+        guard let buffer = selectedBuffer else {
+            print("[SoundEngine] No buffer loaded")
+            return
         }
 
-        return buffer
-    }
-
-    // MARK: - Playback
-
-    /// Play a sound matching the given force level
-    func play(force: Double, volumeScale: Double) {
-        let range = ForceRange(force: force)
-
-        guard let buffers = preloadedBuffers[range], !buffers.isEmpty else { return }
-
-        // Pick random buffer from category
-        let buffer = buffers.randomElement()!
-
-        // Round-robin through player nodes
-        let player = playerNodes[currentPlayerIndex % maxConcurrentPlayers]
-        currentPlayerIndex += 1
-
-        // Stop if already playing
-        if player.isPlaying {
-            player.stop()
+        if playerNode.isPlaying {
+            playerNode.stop()
         }
 
-        // Scale volume by force and user preference
-        let volume = Float(force * volumeScale)
-        player.volume = min(1.0, max(0.1, volume))
+        playerNode.volume = min(1.0, max(0.1, volume))
+        playerNode.scheduleBuffer(buffer, at: nil, options: .interrupts)
+        playerNode.play()
 
-        player.scheduleBuffer(buffer, at: nil, options: .interrupts)
-        player.play()
+        DispatchQueue.main.async { self.isPlaying = true }
 
-        DispatchQueue.main.async {
-            self.isPlaying = true
-        }
-
-        // Reset playing state after estimated duration
         let duration = Double(buffer.frameLength) / buffer.format.sampleRate
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
             self?.isPlaying = false
         }
     }
 
-    /// Preview a specific sound from a pack
+    /// Play a specific sound by ID (for preview/tap)
+    func playSound(id: String, volume: Float = 1.0) {
+        guard let item = availableSounds.first(where: { $0.id == id }),
+              let buffer = loadBuffer(from: item.path) else { return }
+
+        if playerNode.isPlaying {
+            playerNode.stop()
+        }
+
+        playerNode.volume = volume
+        playerNode.scheduleBuffer(buffer, at: nil, options: .interrupts)
+        playerNode.play()
+
+        DispatchQueue.main.async { self.isPlaying = true }
+        let duration = Double(buffer.frameLength) / buffer.format.sampleRate
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
+            self?.isPlaying = false
+        }
+    }
+
+    // Legacy API for ReactionEngine
+    func play(force: Double, volumeScale: Double) {
+        playSelected(volume: Float(volumeScale))
+    }
+
     func preview(range: ForceRange) {
-        play(force: range == .soft ? 0.15 : range == .medium ? 0.5 : 0.85, volumeScale: 0.8)
+        playSelected(volume: 0.8)
     }
 }
