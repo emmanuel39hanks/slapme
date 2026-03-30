@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v13)],
     products: [
         .executable(name: "SlapMe", targets: ["SlapMe"]),
+        .executable(name: "SlapMeDaemon", targets: ["SlapMeDaemon"]),
     ],
     targets: [
         .executableTarget(
@@ -14,6 +15,10 @@ let package = Package(
             resources: [
                 .copy("Resources/SoundPacks")
             ]
+        ),
+        .executableTarget(
+            name: "SlapMeDaemon",
+            path: "SlapMeDaemon"
         ),
         .testTarget(
             name: "SlapMeTests",

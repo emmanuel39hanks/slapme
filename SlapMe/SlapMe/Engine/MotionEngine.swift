@@ -1,29 +1,23 @@
 import Foundation
 import Combine
-import AVFoundation
 
-/// Detects physical slaps using the microphone.
-/// Uses a dual-threshold system: absolute peak + spike ratio above ambient.
-/// Typing and gentle touches are filtered out aggressively.
+/// Connects to SlapMeDaemon via Unix Domain Socket to receive accelerometer-based
+/// slap events. If daemon isn't running, prompts user to start it with admin privileges.
 final class MotionEngine: ObservableObject {
     @Published var currentForce: Double = 0.0
     @Published var isDetecting: Bool = false
     @Published var lastEventTimestamp: Date?
     @Published var comboCount: Int = 0
     @Published var detectionMethod: String = "None"
+    @Published var daemonStatus: String = "Not connected"
 
     let forceEvent = PassthroughSubject<ForceEvent, Never>()
 
-    private var audioEngine: AVAudioEngine?
-    private var cooldownActive = false
+    private let socketPath = "/tmp/slapme.sock"
+    private var socketFD: Int32 = -1
+    private var readThread: Thread?
     private var comboResetTimer: Timer?
-
-    // Ambient noise tracking
-    private var ambientPeaks: [Float] = []
-    private let ambientWindowSize = 80
-
-    // Typing filter: track recent small peaks
-    private var recentPeakTimes: [Date] = []
+    private var isRunning = false
 
     struct ForceEvent {
         let force: Double
@@ -47,147 +41,207 @@ final class MotionEngine: ObservableObject {
 
     func startDetection(settings: SettingsManager) {
         guard !isDetecting else { return }
-        NSLog("[MotionEngine] Starting mic detection...")
+        NSLog("[MotionEngine] Starting accelerometer detection via daemon...")
 
-        switch AVCaptureDevice.authorizationStatus(for: .audio) {
-        case .authorized:
-            beginMicDetection(settings: settings)
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-                if granted {
-                    DispatchQueue.main.async { self?.beginMicDetection(settings: settings) }
+        // Try to connect to existing daemon
+        if connectToDaemon() {
+            startReading(settings: settings)
+            return
+        }
+
+        // Daemon not running — launch it with admin privileges
+        NSLog("[MotionEngine] Daemon not running, launching with admin privileges...")
+        launchDaemon { [weak self] success in
+            if success {
+                // Wait a moment for daemon to start
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if self?.connectToDaemon() == true {
+                        self?.startReading(settings: settings)
+                    } else {
+                        NSLog("[MotionEngine] Failed to connect after launching daemon")
+                        DispatchQueue.main.async {
+                            self?.daemonStatus = "Failed to connect"
+                        }
+                    }
+                }
+            } else {
+                NSLog("[MotionEngine] Failed to launch daemon (user cancelled?)")
+                DispatchQueue.main.async {
+                    self?.daemonStatus = "Not authorized"
                 }
             }
-        default:
-            NSLog("[MotionEngine] Mic access denied")
         }
     }
 
     func stopDetection() {
+        isRunning = false
         isDetecting = false
-        audioEngine?.stop()
-        audioEngine?.inputNode.removeTap(onBus: 0)
-        audioEngine = nil
+        if socketFD >= 0 {
+            close(socketFD)
+            socketFD = -1
+        }
         comboResetTimer?.invalidate()
     }
 
-    // MARK: - Mic
+    // MARK: - Daemon Connection
 
-    private func beginMicDetection(settings: SettingsManager) {
-        let engine = AVAudioEngine()
-        let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
+    private func connectToDaemon() -> Bool {
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return false }
 
-        guard format.sampleRate > 0, format.channelCount > 0 else { return }
-
-        inputNode.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
-            self?.processBuffer(buffer, settings: settings)
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
+            let pathBuf = UnsafeMutableRawPointer(pathPtr).assumingMemoryBound(to: CChar.self)
+            socketPath.withCString { strncpy(pathBuf, $0, 104 - 1) }
         }
 
-        do {
-            try engine.start()
-            audioEngine = engine
-            DispatchQueue.main.async {
-                self.detectionMethod = "Microphone"
-                self.isDetecting = true
+        let result = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
+                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
-            NSLog("[MotionEngine] Mic started (sr=%.0f ch=%d)", format.sampleRate, format.channelCount)
-        } catch {
-            NSLog("[MotionEngine] Mic error: %@", error.localizedDescription)
+        }
+
+        guard result == 0 else {
+            close(fd)
+            return false
+        }
+
+        socketFD = fd
+        NSLog("[MotionEngine] Connected to daemon at %@", socketPath)
+        return true
+    }
+
+    private func startReading(settings: SettingsManager) {
+        isRunning = true
+
+        DispatchQueue.main.async {
+            self.isDetecting = true
+            self.detectionMethod = "Accelerometer"
+            self.daemonStatus = "Connected"
+        }
+
+        // Read from socket in background thread
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            guard let self else { return }
+
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            var lineBuffer = ""
+
+            while self.isRunning && self.socketFD >= 0 {
+                let bytesRead = read(self.socketFD, &buffer, buffer.count)
+                if bytesRead <= 0 {
+                    NSLog("[MotionEngine] Daemon disconnected")
+                    DispatchQueue.main.async {
+                        self.isDetecting = false
+                        self.daemonStatus = "Disconnected"
+                    }
+                    break
+                }
+
+                lineBuffer += String(bytes: buffer[0..<bytesRead], encoding: .utf8) ?? ""
+
+                // Process complete lines
+                while let newlineIdx = lineBuffer.firstIndex(of: "\n") {
+                    let line = String(lineBuffer[lineBuffer.startIndex..<newlineIdx])
+                    lineBuffer = String(lineBuffer[lineBuffer.index(after: newlineIdx)...])
+
+                    self.processEvent(line)
+                }
+            }
         }
     }
 
-    private func processBuffer(_ buffer: AVAudioPCMBuffer, settings: SettingsManager) {
-        guard let channelData = buffer.floatChannelData?[0] else { return }
-        let len = Int(buffer.frameLength)
-        guard len > 0 else { return }
+    private func processEvent(_ json: String) {
+        guard let data = json.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              dict["type"] as? String == "slap",
+              let force = dict["force"] as? Double else { return }
 
-        // Find peak amplitude
-        var peak: Float = 0
-        for i in 0..<len {
-            let s = abs(channelData[i])
-            if s > peak { peak = s }
-        }
-
-        // Update ambient peak baseline (rolling average of peaks)
-        ambientPeaks.append(peak)
-        if ambientPeaks.count > ambientWindowSize { ambientPeaks.removeFirst() }
-
-        // Need enough samples to calibrate
-        guard ambientPeaks.count >= 20 else { return }
-
-        // Ambient level: use the median of recent peaks (robust to outliers)
-        let sorted = ambientPeaks.sorted()
-        let ambientMedian = sorted[sorted.count / 2]
-
-        // ─── DUAL THRESHOLD ───
-        // 1. Absolute minimum peak: must be loud enough to be a physical impact
-        //    Typing is usually < 0.05, slaps are > 0.1
-        let absoluteThreshold: Float = 0.08 / Float(0.5 + settings.sensitivity * 0.5)
-
-        // 2. Relative spike: must be significantly above ambient
-        let spikeRatio = ambientMedian > 0.0001 ? peak / ambientMedian : 0
-        let relativeThreshold: Float = 5.0 / Float(0.5 + settings.sensitivity * 0.5)
-
-        // Both must be met
-        let isImpact = peak > absoluteThreshold && spikeRatio > relativeThreshold
-
-        // ─── TYPING FILTER ───
-        // Typing creates many rapid small-to-medium peaks. A real slap is a single
-        // sharp transient followed by silence. If we see many peaks in quick
-        // succession, it's typing — ignore.
-        let now = Date()
-        if peak > absoluteThreshold * 0.5 {
-            recentPeakTimes.append(now)
-        }
-        recentPeakTimes = recentPeakTimes.filter { now.timeIntervalSince($0) < 0.5 }
-
-        // If more than 4 peaks in 500ms, it's typing
-        let isTyping = recentPeakTimes.count > 4
-
-        // Decay force display
-        if !isImpact {
-            DispatchQueue.main.async {
-                if self.currentForce > 0.01 { self.currentForce *= 0.8 }
-                else { self.currentForce = 0 }
-            }
-            return
-        }
-
-        guard !isTyping else { return }
-        guard !cooldownActive else { return }
-
-        // Normalize force
-        let maxRatio = relativeThreshold * 4.0
-        let force = Double(min(1.0, max(0.1, (spikeRatio - relativeThreshold) / (maxRatio - relativeThreshold))))
-
-        NSLog("[MotionEngine] SLAP! force=%.2f peak=%.3f ratio=%.1f ambient=%.4f", force, peak, spikeRatio, ambientMedian)
+        let x = dict["x"] as? Double ?? 0
+        let y = dict["y"] as? Double ?? 0
+        let z = dict["z"] as? Double ?? 0
 
         let event = ForceEvent(
             force: force,
             category: ForceCategory(force: force),
-            timestamp: now,
-            raw: SIMD3<Double>(Double(peak), Double(ambientMedian), Double(spikeRatio))
+            timestamp: Date(),
+            raw: SIMD3<Double>(x, y, z)
         )
 
-        DispatchQueue.main.async {
-            self.currentForce = force
-            self.lastEventTimestamp = event.timestamp
-            self.comboCount += 1
-            self.forceEvent.send(event)
-            self.startCooldown(interval: max(0.5, settings.cooldownInterval))
-            self.resetComboAfterDelay()
+        DispatchQueue.main.async { [weak self] in
+            self?.currentForce = force
+            self?.lastEventTimestamp = event.timestamp
+            self?.comboCount += 1
+            self?.forceEvent.send(event)
+            self?.resetComboAfterDelay()
+
+            // Decay force display
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                self?.currentForce = 0
+            }
         }
     }
 
-    // MARK: - Cooldown
+    // MARK: - Launch Daemon
 
-    private func startCooldown(interval: Double) {
-        cooldownActive = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + interval) { [weak self] in
-            self?.cooldownActive = false
+    private func launchDaemon(completion: @escaping (Bool) -> Void) {
+        // Find the daemon binary — it's bundled next to the app binary
+        let daemonPath = findDaemonPath()
+
+        guard let path = daemonPath else {
+            NSLog("[MotionEngine] SlapMeDaemon binary not found")
+            completion(false)
+            return
+        }
+
+        NSLog("[MotionEngine] Launching daemon: %@", path)
+
+        // Use osascript to get admin privileges
+        let script = "do shell script \"\\\"\(path)\\\" &\" with administrator privileges"
+
+        DispatchQueue.global().async {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            task.arguments = ["-e", script]
+
+            do {
+                try task.run()
+                task.waitUntilExit()
+                let success = task.terminationStatus == 0
+                DispatchQueue.main.async { completion(success) }
+            } catch {
+                NSLog("[MotionEngine] osascript error: %@", error.localizedDescription)
+                DispatchQueue.main.async { completion(false) }
+            }
         }
     }
+
+    private func findDaemonPath() -> String? {
+        // Check next to the app executable
+        if let exec = Bundle.main.executableURL {
+            let sameDir = exec.deletingLastPathComponent().appendingPathComponent("SlapMeDaemon")
+            if FileManager.default.fileExists(atPath: sameDir.path) { return sameDir.path }
+
+            // In Contents/MacOS/
+            let macosDir = exec.deletingLastPathComponent().appendingPathComponent("SlapMeDaemon")
+            if FileManager.default.fileExists(atPath: macosDir.path) { return macosDir.path }
+
+            // In Contents/Helpers/
+            let helpersDir = exec.deletingLastPathComponent().deletingLastPathComponent()
+                .appendingPathComponent("Helpers/SlapMeDaemon")
+            if FileManager.default.fileExists(atPath: helpersDir.path) { return helpersDir.path }
+        }
+
+        // SPM build directory
+        let buildPath = Bundle.main.executableURL?.deletingLastPathComponent()
+            .appendingPathComponent("SlapMeDaemon")
+        if let p = buildPath, FileManager.default.fileExists(atPath: p.path) { return p.path }
+
+        return nil
+    }
+
+    // MARK: - Combo
 
     private func resetComboAfterDelay() {
         comboResetTimer?.invalidate()
@@ -196,7 +250,7 @@ final class MotionEngine: ObservableObject {
         }
     }
 
-    // MARK: - Simulate
+    // MARK: - Simulate (for UI testing)
 
     func simulateForce(_ force: Double) {
         let normalized = min(1.0, max(0.0, force))
