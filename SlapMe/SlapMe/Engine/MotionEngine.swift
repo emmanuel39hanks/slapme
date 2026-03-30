@@ -1,13 +1,12 @@
 import Foundation
 import Combine
-import IOKit
-import IOKit.hid
+import AVFoundation
 
-/// Detects physical interactions with the MacBook using the Sudden Motion Sensor (SMS)
-/// or accelerometer data via IOKit HID.
+/// Detects physical slaps/taps on the MacBook using the built-in microphone.
 ///
-/// On modern Macs without SMS, falls back to monitoring lid angle sensor
-/// and keyboard/trackpad force heuristics.
+/// The mic picks up impact vibrations transmitted through the chassis.
+/// We analyze audio amplitude in real-time to detect sudden spikes
+/// that indicate physical contact (vs. ambient noise or speech).
 final class MotionEngine: ObservableObject {
     // MARK: - Published State
     @Published var currentForce: Double = 0.0
@@ -19,17 +18,17 @@ final class MotionEngine: ObservableObject {
     let forceEvent = PassthroughSubject<ForceEvent, Never>()
 
     // MARK: - Private
-    private var hidManager: IOHIDManager?
-    private var pollingTimer: Timer?
-    private var lastAcceleration: SIMD3<Double> = .zero
+    private var audioEngine: AVAudioEngine?
     private var cooldownActive = false
     private var comboResetTimer: Timer?
-    private var cancellables = Set<AnyCancellable>()
 
-    // Calibration baseline — set during first few readings
-    private var baseline: SIMD3<Double>?
-    private var calibrationSamples: [SIMD3<Double>] = []
-    private let calibrationCount = 20
+    // Rolling baseline for ambient noise level
+    private var ambientLevel: Float = 0.0
+    private var ambientSamples: [Float] = []
+    private let ambientWindowSize = 60  // ~1 second at 60fps tap node callback
+
+    // Impact detection parameters
+    private var lastPeakTime: Date = .distantPast
 
     struct ForceEvent {
         let force: Double       // 0.0 - 1.0 normalized
@@ -56,169 +55,138 @@ final class MotionEngine: ObservableObject {
 
     func startDetection(settings: SettingsManager) {
         guard !isDetecting else { return }
-        isDetecting = true
 
-        // Strategy 1: Try HID-based accelerometer access
-        if setupHIDAccelerometer() {
-            return
+        // Request mic permission
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            beginAudioDetection(settings: settings)
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                if granted {
+                    DispatchQueue.main.async {
+                        self?.beginAudioDetection(settings: settings)
+                    }
+                }
+            }
+        default:
+            print("[MotionEngine] Microphone access denied")
         }
-
-        // Strategy 2: Polling-based approach using SMC or lid sensor
-        startPollingFallback(settings: settings)
     }
 
     func stopDetection() {
         isDetecting = false
-        pollingTimer?.invalidate()
-        pollingTimer = nil
+        audioEngine?.stop()
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        audioEngine = nil
         comboResetTimer?.invalidate()
+    }
 
-        if let manager = hidManager {
-            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-            hidManager = nil
+    // MARK: - Audio-Based Detection
+
+    private func beginAudioDetection(settings: SettingsManager) {
+        let engine = AVAudioEngine()
+        let inputNode = engine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            print("[MotionEngine] Invalid audio format")
+            return
+        }
+
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.processAudioBuffer(buffer, settings: settings)
+        }
+
+        do {
+            try engine.start()
+            audioEngine = engine
+            DispatchQueue.main.async {
+                self.isDetecting = true
+            }
+        } catch {
+            print("[MotionEngine] Failed to start audio engine: \(error)")
         }
     }
 
-    // MARK: - HID Accelerometer
+    private func processAudioBuffer(_ buffer: AVAudioPCMBuffer, settings: SettingsManager) {
+        guard let channelData = buffer.floatChannelData?[0] else { return }
+        let frameLength = Int(buffer.frameLength)
+        guard frameLength > 0 else { return }
 
-    private func setupHIDAccelerometer() -> Bool {
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        hidManager = manager
-
-        // Match accelerometer devices
-        let matchDict: [String: Any] = [
-            kIOHIDDeviceUsagePageKey: kHIDPage_GenericDesktop,
-            kIOHIDDeviceUsageKey: kHIDUsage_GD_Mouse, // Accelerometers sometimes register here
-        ]
-        IOHIDManagerSetDeviceMatching(manager, matchDict as CFDictionary)
-
-        let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard result == kIOReturnSuccess else {
-            hidManager = nil
-            return false
+        // Calculate RMS (root mean square) of the buffer
+        var sumSquares: Float = 0
+        var peak: Float = 0
+        for i in 0..<frameLength {
+            let sample = abs(channelData[i])
+            sumSquares += sample * sample
+            if sample > peak { peak = sample }
         }
+        let rms = sqrt(sumSquares / Float(frameLength))
 
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-        return true
-    }
-
-    // MARK: - Polling Fallback
-
-    /// Uses IOKit to read sudden motion sensor data or simulates via
-    /// system load heuristics. On real hardware, this reads the SMS.
-    private func startPollingFallback(settings: SettingsManager) {
-        // Poll at 100Hz for responsive detection
-        pollingTimer = Timer.scheduledTimer(withTimeInterval: 0.01, repeats: true) { [weak self] _ in
-            guard let self, self.isDetecting else { return }
-            self.pollAccelerometer(settings: settings)
+        // Update ambient noise baseline (slow-moving average)
+        ambientSamples.append(rms)
+        if ambientSamples.count > ambientWindowSize {
+            ambientSamples.removeFirst()
         }
-    }
+        ambientLevel = ambientSamples.reduce(0, +) / Float(ambientSamples.count)
 
-    private func pollAccelerometer(settings: SettingsManager) {
-        // Read SMS data via IOKit
-        let accel = readSMSData()
+        // Impact detection: look for sudden spikes above ambient
+        // A physical slap creates a sharp transient that's 3-10x above ambient
+        let spikeRatio = ambientLevel > 0.0001 ? peak / ambientLevel : peak / 0.001
+        let sensitivityMultiplier = Float(0.3 + settings.sensitivity * 0.7)
 
-        // Calibration phase
-        if baseline == nil {
-            calibrationSamples.append(accel)
-            if calibrationSamples.count >= calibrationCount {
-                let sum = calibrationSamples.reduce(SIMD3<Double>.zero, +)
-                baseline = sum / Double(calibrationCount)
-                calibrationSamples.removeAll()
+        // Threshold: spike must be significantly above ambient
+        let threshold: Float = 4.0 / sensitivityMultiplier  // Higher sensitivity = lower threshold
+
+        guard spikeRatio > threshold else {
+            // Decay force display smoothly
+            DispatchQueue.main.async {
+                if self.currentForce > 0.01 {
+                    self.currentForce *= 0.85
+                } else {
+                    self.currentForce = 0
+                }
             }
             return
         }
 
-        // Calculate delta from baseline
-        let delta = accel - (baseline ?? .zero)
-        let magnitude = sqrt(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z)
+        // Normalize force: map spike ratio to 0-1
+        // threshold..threshold*4 → 0..1
+        let maxRatio = threshold * 5.0
+        let normalizedForce = Double(min(1.0, max(0.0, (spikeRatio - threshold) / (maxRatio - threshold))))
 
-        // Apply sensitivity scaling
-        let scaledMagnitude = magnitude * (0.5 + settings.sensitivity)
-
-        // Normalize to 0-1 range (tuned for typical MacBook accelerometer values)
-        let normalized = min(1.0, max(0.0, scaledMagnitude / 2.0))
-
-        DispatchQueue.main.async {
-            self.currentForce = normalized
-        }
-
-        // Check threshold
-        guard normalized >= settings.forceThreshold else { return }
-        guard !cooldownActive else { return }
-
-        // Typing protection: ignore if force is in the light-tap range
-        // and events are happening very rapidly (typical of typing)
-        if settings.typingProtection && normalized < 0.25 {
+        guard !cooldownActive else {
+            DispatchQueue.main.async {
+                self.currentForce = normalizedForce
+            }
             return
         }
 
-        // Fire event
+        // Typing protection: very light taps in rapid succession are likely typing
+        if settings.typingProtection {
+            let timeSinceLast = Date().timeIntervalSince(lastPeakTime)
+            if normalizedForce < 0.2 && timeSinceLast < 0.15 {
+                return
+            }
+        }
+
+        lastPeakTime = Date()
+
         let event = ForceEvent(
-            force: normalized,
-            category: ForceCategory(force: normalized),
+            force: normalizedForce,
+            category: ForceCategory(force: normalizedForce),
             timestamp: Date(),
-            raw: accel
+            raw: SIMD3<Double>(Double(peak), Double(rms), Double(spikeRatio))
         )
 
         DispatchQueue.main.async {
+            self.currentForce = normalizedForce
             self.lastEventTimestamp = event.timestamp
             self.comboCount += 1
             self.forceEvent.send(event)
             self.startCooldown(interval: settings.cooldownInterval)
             self.resetComboAfterDelay()
         }
-    }
-
-    /// Read the Sudden Motion Sensor via IOKit.
-    /// Returns acceleration as a 3D vector.
-    private func readSMSData() -> SIMD3<Double> {
-        var service: io_service_t = 0
-
-        // Try common SMS service names
-        let serviceNames = ["SMCMotionSensor", "IOI2CMotionSensor", "AppleSMCMotionSensor"]
-        for name in serviceNames {
-            service = IOServiceGetMatchingService(
-                kIOMainPortDefault,
-                IOServiceMatching(name)
-            )
-            if service != 0 { break }
-        }
-
-        guard service != 0 else {
-            // No hardware SMS — return noise-free zero
-            // In production, this would integrate with other sensors
-            return .zero
-        }
-
-        var connection: io_connect_t = 0
-        let kr = IOServiceOpen(service, mach_task_self_, 0, &connection)
-        IOObjectRelease(service)
-
-        guard kr == KERN_SUCCESS else { return .zero }
-
-        // SMS returns 40 bytes; first 3 int16s are x,y,z
-        var outputSize: Int = 40
-        var outputData = [UInt8](repeating: 0, count: 40)
-        var inputData: [UInt8] = []
-        let inputSize = 0
-
-        let result = IOConnectCallStructMethod(
-            connection, 5,
-            &inputData, inputSize,
-            &outputData, &outputSize
-        )
-
-        IOServiceClose(connection)
-
-        guard result == KERN_SUCCESS, outputSize >= 6 else { return .zero }
-
-        let x = Double(Int16(outputData[0]) | (Int16(outputData[1]) << 8))
-        let y = Double(Int16(outputData[2]) | (Int16(outputData[3]) << 8))
-        let z = Double(Int16(outputData[4]) | (Int16(outputData[5]) << 8))
-
-        // Normalize from raw SMS range (~±256) to ~±1g
-        return SIMD3<Double>(x / 256.0, y / 256.0, z / 256.0)
     }
 
     // MARK: - Cooldown & Combo
@@ -239,9 +207,9 @@ final class MotionEngine: ObservableObject {
         }
     }
 
-    // MARK: - Test / Simulate
+    // MARK: - Simulate
 
-    /// Inject a simulated force event for testing
+    /// Inject a simulated force event for testing / sound board buttons
     func simulateForce(_ force: Double) {
         let normalized = min(1.0, max(0.0, force))
         let event = ForceEvent(
@@ -258,8 +226,7 @@ final class MotionEngine: ObservableObject {
             self.forceEvent.send(event)
         }
 
-        // Auto-decay force display
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.currentForce = 0
         }
     }

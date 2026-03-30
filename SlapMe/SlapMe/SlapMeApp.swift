@@ -35,7 +35,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         soundEngine.preloadCurrentPack(settings: settingsManager)
-        reactionEngine.start()
 
         // Menu bar
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -47,7 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let popover = NSPopover()
-        popover.contentSize = NSSize(width: 320, height: 420)
+        popover.contentSize = NSSize(width: 280, height: 440)
         popover.behavior = .transient
         popover.contentViewController = NSHostingController(
             rootView: MenuBarView()

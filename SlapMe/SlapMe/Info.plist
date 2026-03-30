@@ -14,10 +14,18 @@
     <string>1.0.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleExecutable</key>
+    <string>SlapMe</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>SlapMe uses the microphone to detect physical taps and slaps on your MacBook.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright 2026 SchemaLabs. All rights reserved.</string>
 </dict>

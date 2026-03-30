@@ -1,20 +1,20 @@
 {
-  "name": "Default",
+  "name": "Meme Pack",
   "author": "SlapMe",
   "version": "1.0.0",
-  "description": "Built-in classic sound effects — satisfying thuds, pops, and impacts.",
+  "description": "Viral meme sounds — bruh, sheesh, vine boom and more.",
   "sounds": {
     "soft": [
-      "soft_tap_1.wav",
-      "soft_tap_2.wav"
+      "oof.mp3",
+      "noice.mp3"
     ],
     "medium": [
-      "medium_hit_1.wav",
-      "medium_hit_2.wav"
+      "bruh.mp3",
+      "sheesh.mp3"
     ],
     "hard": [
-      "hard_slap_1.wav",
-      "hard_slap_2.wav"
+      "vineboom.mp3",
+      "letsgo.mp3"
     ]
   }
 }
