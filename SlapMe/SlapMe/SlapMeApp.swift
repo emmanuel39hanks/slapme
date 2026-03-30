@@ -36,7 +36,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             motion: motionEngine
         )
 
-        soundEngine.preloadCurrentPack(settings: settingsManager)
+        soundEngine.preloadAll()
         reactionEngine.start()
 
         // Menu bar with slap count

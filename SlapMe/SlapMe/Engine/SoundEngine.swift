@@ -14,6 +14,7 @@ final class SoundEngine: ObservableObject {
     }
 
     private var currentSound: NSSound?
+    private var preloadedSounds: [String: NSSound] = [:]
 
     struct SoundItem: Identifiable, Hashable {
         let id: String
@@ -89,12 +90,19 @@ final class SoundEngine: ObservableObject {
 
         NSLog("[SoundEngine] Loaded %d sounds: %@", items.count, items.map(\.name).joined(separator: ", "))
 
-        DispatchQueue.main.async {
-            self.availableSounds = items
-            if self.selectedSound.isEmpty || !items.contains(where: { $0.id == self.selectedSound }) {
-                self.selectedSound = items.first?.id ?? ""
+        // Set synchronously first so preloadAll works immediately after
+        self.availableSounds = items
+        if self.selectedSound.isEmpty || !items.contains(where: { $0.id == self.selectedSound }) {
+            self.selectedSound = items.first?.id ?? ""
+        }
+
+        // Preload into memory
+        for item in items {
+            if let s = NSSound(contentsOf: item.path, byReference: true) {
+                preloadedSounds[item.id] = s
             }
         }
+        NSLog("[SoundEngine] Preloaded %d sounds into memory", preloadedSounds.count)
     }
 
     func preloadCurrentPack(settings: SettingsManager) {
@@ -119,24 +127,43 @@ final class SoundEngine: ObservableObject {
         playFile(url: item.path, volume: volume)
     }
 
-    private func playFile(url: URL, volume: Float) {
-        // Stop current
-        currentSound?.stop()
+    /// Preload all sounds into memory so playback is instant
+    func preloadAll() {
+        for item in availableSounds {
+            if let s = NSSound(contentsOf: item.path, byReference: true) {
+                preloadedSounds[item.id] = s
+            }
+        }
+        NSLog("[SoundEngine] Preloaded %d sounds", preloadedSounds.count)
+    }
 
-        // NSSound — works regardless of AVAudioEngine state, no entitlements needed for output
-        guard let sound = NSSound(contentsOf: url, byReference: false) else {
+    private func playFile(url: URL, volume: Float) {
+        let filename = url.lastPathComponent
+
+        // Use preloaded copy (make a fresh copy so we can play overlapping)
+        let sound: NSSound?
+        if let preloaded = preloadedSounds[filename] {
+            sound = preloaded.copy() as? NSSound
+        } else {
+            sound = NSSound(contentsOf: url, byReference: true)
+        }
+
+        guard let s = sound else {
             NSLog("[SoundEngine] FAILED to load: %@", url.path)
             return
         }
 
-        sound.volume = volume
-        sound.play()
-        currentSound = sound
+        // Stop previous only if same sound
+        currentSound?.stop()
 
-        NSLog("[SoundEngine] Playing: %@", url.lastPathComponent)
+        s.volume = volume
+        s.play()
+        currentSound = s
+
+        NSLog("[SoundEngine] Playing: %@", filename)
 
         DispatchQueue.main.async { self.isPlaying = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + sound.duration) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + s.duration) { [weak self] in
             self?.isPlaying = false
         }
     }
