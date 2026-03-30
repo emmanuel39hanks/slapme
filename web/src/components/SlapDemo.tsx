@@ -10,6 +10,7 @@ const sounds = [
   { label: "Noice", file: "/sounds/noice.mp3", color: "#f3f4f6" },
   { label: "Vine Boom", file: "/sounds/vineboom.mp3", color: "#f3f4f6" },
   { label: "Oof", file: "/sounds/oof.mp3", color: "#f3f4f6" },
+  { label: "Moan", file: "/sounds/moan.mp3", color: "#f3f4f6" },
 ];
 
 export function SlapDemo() {
