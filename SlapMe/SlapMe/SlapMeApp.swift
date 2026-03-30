@@ -1,4 +1,5 @@
 import SwiftUI
+import AVFoundation
 
 @main
 struct SlapMeApp: App {
@@ -24,8 +25,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var reactionEngine: ReactionEngine!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Hide dock icon
         NSApp.setActivationPolicy(.accessory)
+
+        // Request mic permission immediately
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            print("[SlapMe] Microphone access: \(granted ? "granted" : "denied")")
+        }
 
         // Wire up engines
         reactionEngine = ReactionEngine(
@@ -35,6 +40,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
 
         soundEngine.preloadCurrentPack(settings: settingsManager)
+
+        // Start detection!
+        reactionEngine.start()
 
         // Menu bar
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -55,6 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 .environmentObject(soundEngine)
         )
         self.popover = popover
+
+        print("[SlapMe] App launched, detection started")
     }
 
     @objc private func togglePopover() {

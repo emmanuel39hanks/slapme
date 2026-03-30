@@ -92,9 +92,16 @@ final class SoundEngine: ObservableObject {
     func scanAvailablePacks() {
         var packs: [SoundPackMeta] = []
 
-        // Check bundle resources
-        if let bundlePath = Bundle.main.resourceURL?.appendingPathComponent("SoundPacks") {
-            packs.append(contentsOf: scanPacksAt(bundlePath))
+        // SPM resource bundle (Bundle.module)
+        let moduleSoundPacks = Bundle.module.resourceURL?.appendingPathComponent("SoundPacks")
+        if let path = moduleSoundPacks {
+            print("[SoundEngine] Scanning SPM bundle: \(path.path)")
+            packs.append(contentsOf: scanPacksAt(path))
+        }
+
+        // Also check main bundle (Xcode builds)
+        if let mainPath = Bundle.main.resourceURL?.appendingPathComponent("SoundPacks") {
+            packs.append(contentsOf: scanPacksAt(mainPath))
         }
 
         // Check Application Support for user packs
@@ -103,16 +110,18 @@ final class SoundEngine: ObservableObject {
             packs.append(contentsOf: scanPacksAt(userPacksDir))
         }
 
-        // Include built-in default if nothing found
         if packs.isEmpty {
+            print("[SoundEngine] WARNING: No sound packs found, using synthesized fallback")
             packs.append(SoundPackMeta(
                 id: "default",
                 name: "Default",
                 author: "SlapMe",
-                description: "Built-in sound effects",
-                path: Bundle.main.resourceURL ?? URL(fileURLWithPath: "/")
+                description: "Synthesized fallback sounds",
+                path: Bundle.module.resourceURL ?? Bundle.main.resourceURL ?? URL(fileURLWithPath: "/")
             ))
         }
+
+        print("[SoundEngine] Found \(packs.count) sound pack(s): \(packs.map(\.name))")
 
         DispatchQueue.main.async {
             self.availablePacks = packs
@@ -144,16 +153,21 @@ final class SoundEngine: ObservableObject {
 
     func preloadCurrentPack(settings: SettingsManager) {
         let packId = settings.selectedSoundPack
+        print("[SoundEngine] Preloading pack: \(packId)")
 
         // Find pack path
         guard let meta = availablePacks.first(where: { $0.id == packId }) else {
+            print("[SoundEngine] Pack '\(packId)' not found in \(availablePacks.map(\.id)), using fallback")
             preloadDefaultSounds()
             return
         }
 
         let metaURL = meta.path.appendingPathComponent("metadata.json")
+        print("[SoundEngine] Loading metadata from: \(metaURL.path)")
+
         guard let data = try? Data(contentsOf: metaURL),
               let pack = try? JSONDecoder().decode(SoundPack.self, from: data) else {
+            print("[SoundEngine] Failed to load metadata.json, using fallback")
             preloadDefaultSounds()
             return
         }
@@ -163,14 +177,26 @@ final class SoundEngine: ObservableObject {
 
         // Preload each category
         preloadedBuffers[.soft] = pack.sounds.soft.compactMap {
-            loadBuffer(from: meta.path.appendingPathComponent($0))
+            let url = meta.path.appendingPathComponent($0)
+            let buf = loadBuffer(from: url)
+            print("[SoundEngine] Load \($0): \(buf != nil ? "OK" : "FAILED") (\(url.path))")
+            return buf
         }
         preloadedBuffers[.medium] = pack.sounds.medium.compactMap {
-            loadBuffer(from: meta.path.appendingPathComponent($0))
+            let url = meta.path.appendingPathComponent($0)
+            let buf = loadBuffer(from: url)
+            print("[SoundEngine] Load \($0): \(buf != nil ? "OK" : "FAILED")")
+            return buf
         }
         preloadedBuffers[.hard] = pack.sounds.hard.compactMap {
-            loadBuffer(from: meta.path.appendingPathComponent($0))
+            let url = meta.path.appendingPathComponent($0)
+            let buf = loadBuffer(from: url)
+            print("[SoundEngine] Load \($0): \(buf != nil ? "OK" : "FAILED")")
+            return buf
         }
+
+        let total = preloadedBuffers.values.reduce(0) { $0 + $1.count }
+        print("[SoundEngine] Preloaded \(total) sound buffers")
     }
 
     private func preloadDefaultSounds() {
