@@ -1,0 +1,20 @@
+{
+  "name": "Default",
+  "author": "SlapMe",
+  "version": "1.0.0",
+  "description": "Built-in classic sound effects — satisfying thuds, pops, and impacts.",
+  "sounds": {
+    "soft": [
+      "soft_tap_1.wav",
+      "soft_tap_2.wav"
+    ],
+    "medium": [
+      "medium_hit_1.wav",
+      "medium_hit_2.wav"
+    ],
+    "hard": [
+      "hard_slap_1.wav",
+      "hard_slap_2.wav"
+    ]
+  }
+}
