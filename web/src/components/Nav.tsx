@@ -45,7 +45,7 @@ export function Nav() {
 
         <div className="flex items-center gap-1">
           <a
-            href="https://github.com"
+            href="https://github.com/emmanuel39hanks/slapme"
             target="_blank"
             rel="noopener noreferrer"
             className="rounded-full px-3 py-1.5 text-[13px] text-gray-500 transition-colors hover:text-gray-950"
@@ -53,7 +53,8 @@ export function Nav() {
             GitHub
           </a>
           <a
-            href="#"
+            href="/SlapMe.zip"
+            download
             className="rounded-full bg-gray-950 px-4 py-1.5 text-[13px] font-medium text-white transition-all duration-200 hover:bg-gray-800"
           >
             Download

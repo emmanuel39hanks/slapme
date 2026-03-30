@@ -55,7 +55,7 @@ export default function Home() {
                 Download for Mac
               </a>
               <a
-                href="https://github.com"
+                href="https://github.com/emmanuel39hanks/slapme"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="inline-flex items-center gap-2 text-sm font-medium text-gray-500 transition-colors hover:text-gray-950"
@@ -96,7 +96,7 @@ export default function Home() {
           <span>&copy; 2026 SlapMe</span>
           <div className="flex gap-6">
             <a
-              href="https://github.com"
+              href="https://github.com/emmanuel39hanks/slapme"
               target="_blank"
               rel="noopener noreferrer"
               className="transition-colors hover:text-gray-600"
