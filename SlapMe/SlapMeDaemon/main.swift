@@ -1,87 +1,23 @@
-/// SlapMeDaemon — Privileged helper that reads the Apple Silicon accelerometer
-/// via IOKit HID and broadcasts slap events over a Unix Domain Socket.
+/// SlapHelper — Reads the Apple Silicon accelerometer via IOKit HID and
+/// outputs slap events as JSON lines to stdout. No root privileges needed.
 ///
-/// Must run as root: sudo SlapMeDaemon
+/// IOKit HID callbacks only fire under CFRunLoopRun(), NOT NSApplication.run(),
+/// so this runs as a helper process launched by the main app.
 
 import Foundation
 import IOKit
 import IOKit.hid
 
-// MARK: - Config
+// Disable output buffering
+setbuf(stdout, nil)
+setbuf(stderr, nil)
 
-let socketPath = "/tmp/slapme.sock"
-let sampleRate = 100 // approximate Hz from HID reports
+// MARK: - Globals (must persist for HID callback lifetime)
 
-// MARK: - Socket Server
+var buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
+buf.initialize(repeating: 0, count: 64)
 
-var clientFDs: [Int32] = []
-var serverFD: Int32 = -1
-
-func startSocketServer() {
-    // Remove stale socket
-    unlink(socketPath)
-
-    serverFD = socket(AF_UNIX, SOCK_STREAM, 0)
-    guard serverFD >= 0 else {
-        print("[Daemon] Failed to create socket")
-        exit(1)
-    }
-
-    var addr = sockaddr_un()
-    addr.sun_family = sa_family_t(AF_UNIX)
-    withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
-        let pathBuf = UnsafeMutableRawPointer(pathPtr).assumingMemoryBound(to: CChar.self)
-        socketPath.withCString { strncpy(pathBuf, $0, 104 - 1) }
-    }
-
-    let bindResult = withUnsafePointer(to: &addr) { ptr in
-        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-            bind(serverFD, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
-        }
-    }
-    guard bindResult == 0 else {
-        print("[Daemon] Failed to bind: \(String(cString: strerror(errno)))")
-        exit(1)
-    }
-
-    listen(serverFD, 5)
-    chmod(socketPath, 0o777) // Allow non-root app to connect
-
-    print("[Daemon] Listening on \(socketPath)")
-
-    // Accept connections in background
-    DispatchQueue.global().async {
-        while true {
-            let clientFD = accept(serverFD, nil, nil)
-            if clientFD >= 0 {
-                print("[Daemon] Client connected (fd=\(clientFD))")
-                clientFDs.append(clientFD)
-            }
-        }
-    }
-}
-
-func broadcast(_ message: String) {
-    let data = (message + "\n").data(using: .utf8)!
-    var deadFDs: [Int32] = []
-
-    for fd in clientFDs {
-        let result = data.withUnsafeBytes { ptr in
-            write(fd, ptr.baseAddress!, ptr.count)
-        }
-        if result < 0 {
-            deadFDs.append(fd)
-        }
-    }
-
-    clientFDs.removeAll { deadFDs.contains($0) }
-}
-
-// MARK: - Accelerometer
-
-var reportBuffer = [UInt8](repeating: 0, count: 64)
-
-// STA/LTA for slap detection
+var sampleCount = 0
 var shortTermEnergy: [Double] = []
 var longTermEnergy: [Double] = []
 let staWindow = 12
@@ -89,127 +25,103 @@ let ltaWindow = 200
 var cooldownUntil = Date.distantPast
 
 func readInt32LE(_ ptr: UnsafeMutablePointer<UInt8>, offset: Int) -> Int32 {
-    Int32(ptr[offset])
-        | (Int32(ptr[offset + 1]) << 8)
-        | (Int32(ptr[offset + 2]) << 16)
-        | (Int32(ptr[offset + 3]) << 24)
+    Int32(ptr[offset]) | (Int32(ptr[offset + 1]) << 8)
+        | (Int32(ptr[offset + 2]) << 16) | (Int32(ptr[offset + 3]) << 24)
 }
 
-func handleReport(_ report: UnsafeMutablePointer<UInt8>, length: Int) {
-    guard length >= 18 else { return }
+// MARK: - Setup
 
-    let x = Double(readInt32LE(report, offset: 6)) / 65536.0
-    let y = Double(readInt32LE(report, offset: 10)) / 65536.0
-    let z = Double(readInt32LE(report, offset: 14)) / 65536.0
-    let magnitude = sqrt(x * x + y * y + z * z)
+let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+let matching: [String: Any] = [
+    kIOHIDPrimaryUsagePageKey as String: 0xFF00,
+    kIOHIDPrimaryUsageKey as String: 3,
+]
+IOHIDManagerSetDeviceMatching(mgr, matching as CFDictionary)
+IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
 
-    // Energy = squared deviation from gravity (~1g at rest)
-    let energy = (magnitude - 1.0) * (magnitude - 1.0)
-
-    shortTermEnergy.append(energy)
-    longTermEnergy.append(energy)
-    if shortTermEnergy.count > staWindow { shortTermEnergy.removeFirst() }
-    if longTermEnergy.count > ltaWindow { longTermEnergy.removeFirst() }
-
-    guard longTermEnergy.count >= ltaWindow / 2 else { return }
-
-    let sta = shortTermEnergy.reduce(0, +) / Double(shortTermEnergy.count)
-    let lta = longTermEnergy.reduce(0, +) / Double(longTermEnergy.count)
-
-    // STA/LTA ratio — classic seismology trigger
-    let ratio = lta > 0.00001 ? sta / lta : 1.0
-
-    // Also check absolute deviation
-    let deviation = abs(magnitude - 1.0)
-
-    // Trigger conditions
-    guard ratio > 3.0, deviation > 0.15 else { return }
-    guard Date() > cooldownUntil else { return }
-
-    // Normalize force: 0.15g deviation = light tap, 3g+ = hard slap
-    let force = min(1.0, max(0.1, deviation / 2.5))
-
-    cooldownUntil = Date().addingTimeInterval(0.5)
-
-    let event = String(format: "{\"type\":\"slap\",\"force\":%.3f,\"x\":%.3f,\"y\":%.3f,\"z\":%.3f,\"mag\":%.3f}", force, x, y, z, magnitude)
-    print("[Daemon] SLAP! force=\(String(format: "%.2f", force)) mag=\(String(format: "%.3f", magnitude)) ratio=\(String(format: "%.1f", ratio))")
-    broadcast(event)
+guard let devices = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice> else {
+    fputs("[SlapHelper] ERROR: No HID devices found\n", stderr)
+    exit(1)
 }
 
-func startAccelerometer() -> Bool {
-    let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+fputs("[SlapHelper] Found \(devices.count) accelerometer device(s)\n", stderr)
 
-    // Match Apple SPU accelerometer: usage page 0xFF00, usage 3
-    let matching: [String: Any] = [
-        kIOHIDPrimaryUsagePageKey as String: 0xFF00,
-        kIOHIDPrimaryUsageKey as String: 3
-    ]
-    IOHIDManagerSetDeviceMatching(manager, matching as CFDictionary)
-    IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+// Register callbacks on ALL matching devices. The FIFO device (Keyboard/Trackpad)
+// sends the actual accelerometer data, but the SPU device must also be opened —
+// skipping it prevents the FIFO device from delivering callbacks.
+var opened = false
+for dev in devices {
+    let transport = IOHIDDeviceGetProperty(dev, "Transport" as CFString) as? String ?? "?"
+    let product = IOHIDDeviceGetProperty(dev, "Product" as CFString) as? String ?? "Unknown"
 
-    let openResult = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-    guard openResult == kIOReturnSuccess else {
-        print("[Daemon] HID manager open failed: \(openResult). Are you running as root (sudo)?")
-        return false
+    let result = IOHIDDeviceOpen(dev, IOOptionBits(kIOHIDOptionsTypeNone))
+    if result != kIOReturnSuccess {
+        fputs("[SlapHelper] Failed to open \(product): \(result)\n", stderr)
+        continue
     }
 
-    guard let deviceSet = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice>,
-          let device = deviceSet.first else {
-        print("[Daemon] No AppleSPUHIDDevice accelerometer found.")
-        print("[Daemon] This Mac may not have the SPU sensor (need Apple Silicon M1 Pro or later)")
-        return false
-    }
+    IOHIDDeviceSetProperty(dev, "ReportInterval" as CFString, 1000 as CFNumber)
 
-    let deviceOpenResult = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
-    guard deviceOpenResult == kIOReturnSuccess else {
-        print("[Daemon] Failed to open HID device: \(deviceOpenResult)")
-        return false
-    }
-
-    print("[Daemon] Accelerometer opened successfully")
-
-    // Register callback
     IOHIDDeviceRegisterInputReportCallback(
-        device,
-        &reportBuffer,
-        reportBuffer.count,
-        { context, result, sender, type, reportID, report, length in
-            handleReport(report, length: Int(length))
-        },
-        nil
-    )
+        dev, buf, 64,
+        { _, _, _, _, _, report, length in
+            sampleCount += 1
+            guard length >= 18 else { return }
 
-    IOHIDDeviceScheduleWithRunLoop(device, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+            if sampleCount == 1 || sampleCount % 2000 == 0 {
+                fputs("[SlapHelper] Alive: \(sampleCount) samples\n", stderr)
+            }
 
-    return true
+            let x = Double(readInt32LE(report, offset: 6)) / 65536.0
+            let y = Double(readInt32LE(report, offset: 10)) / 65536.0
+            let z = Double(readInt32LE(report, offset: 14)) / 65536.0
+            let magnitude = sqrt(x * x + y * y + z * z)
+            let energy = (magnitude - 1.0) * (magnitude - 1.0)
+
+            shortTermEnergy.append(energy)
+            longTermEnergy.append(energy)
+            if shortTermEnergy.count > staWindow { shortTermEnergy.removeFirst() }
+            if longTermEnergy.count > ltaWindow { longTermEnergy.removeFirst() }
+
+            guard longTermEnergy.count >= ltaWindow / 2 else { return }
+
+            let sta = shortTermEnergy.reduce(0, +) / Double(shortTermEnergy.count)
+            let lta = longTermEnergy.reduce(0, +) / Double(longTermEnergy.count)
+            let ratio = lta > 0.00001 ? sta / lta : 1.0
+            let deviation = abs(magnitude - 1.0)
+
+            // STA/LTA trigger + minimum deviation
+            guard ratio > 3.0, deviation > 0.15 else { return }
+            guard Date() > cooldownUntil else { return }
+
+            let force = min(1.0, max(0.1, deviation / 2.5))
+            cooldownUntil = Date().addingTimeInterval(0.5)
+
+            // JSON event to stdout — the app reads this via pipe
+            print(
+                "{\"type\":\"slap\",\"force\":\(String(format: "%.3f", force)),\"x\":\(String(format: "%.3f", x)),\"y\":\(String(format: "%.3f", y)),\"z\":\(String(format: "%.3f", z)),\"mag\":\(String(format: "%.3f", magnitude))}"
+            )
+            fputs(
+                "[SlapHelper] SLAP! force=\(String(format: "%.2f", force)) mag=\(String(format: "%.3f", magnitude)) ratio=\(String(format: "%.1f", ratio))\n",
+                stderr)
+        }, nil)
+
+    IOHIDDeviceScheduleWithRunLoop(dev, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
+    fputs("[SlapHelper] Registered: \(product) (\(transport))\n", stderr)
+    opened = true
 }
 
-// MARK: - Main
-
-print("[Daemon] SlapMe Daemon starting...")
-print("[Daemon] PID: \(ProcessInfo.processInfo.processIdentifier)")
-print("[Daemon] Running as: \(NSUserName()) (uid=\(getuid()))")
-
-guard getuid() == 0 else {
-    print("[Daemon] ERROR: Must run as root. Use: sudo SlapMeDaemon")
+guard opened else {
+    fputs("[SlapHelper] ERROR: Could not open any accelerometer device\n", stderr)
     exit(1)
 }
 
-startSocketServer()
+// Signal readiness to parent
+print("READY")
 
-guard startAccelerometer() else {
-    print("[Daemon] Failed to start accelerometer")
-    exit(1)
-}
+// Exit cleanly when parent dies
+signal(SIGPIPE) { _ in exit(0) }
 
-print("[Daemon] Ready — waiting for slaps...")
-
-// Keep the run loop alive
-signal(SIGINT) { _ in
-    print("\n[Daemon] Shutting down...")
-    unlink(socketPath)
-    if serverFD >= 0 { close(serverFD) }
-    exit(0)
-}
-
+// Run the event loop — HID callbacks are delivered here
 CFRunLoopRun()

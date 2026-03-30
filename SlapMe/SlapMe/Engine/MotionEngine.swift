@@ -1,8 +1,11 @@
 import Foundation
 import Combine
 
-/// Connects to SlapMeDaemon via Unix Domain Socket to receive accelerometer-based
-/// slap events. If daemon isn't running, prompts user to start it with admin privileges.
+/// Launches the SlapHelper subprocess to read the accelerometer and receive slap events.
+///
+/// IOKit HID callbacks only fire under CFRunLoopRun(), NOT under NSApplication.run().
+/// So we use a helper process that runs its own CFRunLoop and pipes slap events as
+/// JSON lines to stdout, which we read here.
 final class MotionEngine: ObservableObject {
     @Published var currentForce: Double = 0.0
     @Published var isDetecting: Bool = false
@@ -13,11 +16,8 @@ final class MotionEngine: ObservableObject {
 
     let forceEvent = PassthroughSubject<ForceEvent, Never>()
 
-    private let socketPath = "/tmp/slapme.sock"
-    private var socketFD: Int32 = -1
-    private var readThread: Thread?
+    private var helperProcess: Process?
     private var comboResetTimer: Timer?
-    private var isRunning = false
 
     struct ForceEvent {
         let force: Double
@@ -37,116 +37,97 @@ final class MotionEngine: ObservableObject {
         }
     }
 
-    // MARK: - Start
+    // MARK: - Start / Stop
 
     func startDetection(settings: SettingsManager) {
         guard !isDetecting else { return }
-        NSLog("[MotionEngine] Starting accelerometer detection via daemon...")
+        NSLog("[MotionEngine] Starting accelerometer detection via helper process...")
 
-        // Try to connect to existing daemon
-        if connectToDaemon() {
-            startReading(settings: settings)
+        guard let helperPath = findHelperPath() else {
+            NSLog("[MotionEngine] SlapMeDaemon helper binary not found")
+            DispatchQueue.main.async {
+                self.daemonStatus = "Helper not found"
+            }
             return
         }
 
-        // Daemon not running — launch it with admin privileges
-        NSLog("[MotionEngine] Daemon not running, launching with admin privileges...")
-        launchDaemon { [weak self] success in
-            if success {
-                // Wait a moment for daemon to start
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                    if self?.connectToDaemon() == true {
-                        self?.startReading(settings: settings)
-                    } else {
-                        NSLog("[MotionEngine] Failed to connect after launching daemon")
-                        DispatchQueue.main.async {
-                            self?.daemonStatus = "Failed to connect"
-                        }
-                    }
-                }
-            } else {
-                NSLog("[MotionEngine] Failed to launch daemon (user cancelled?)")
-                DispatchQueue.main.async {
-                    self?.daemonStatus = "Not authorized"
-                }
-            }
-        }
+        NSLog("[MotionEngine] Launching helper: %@", helperPath)
+        launchHelper(path: helperPath)
     }
 
     func stopDetection() {
-        isRunning = false
+        helperProcess?.terminate()
+        helperProcess = nil
         isDetecting = false
-        if socketFD >= 0 {
-            close(socketFD)
-            socketFD = -1
-        }
         comboResetTimer?.invalidate()
     }
 
-    // MARK: - Daemon Connection
+    // MARK: - Helper Process
 
-    private func connectToDaemon() -> Bool {
-        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard fd >= 0 else { return false }
+    private func launchHelper(path: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
 
-        var addr = sockaddr_un()
-        addr.sun_family = sa_family_t(AF_UNIX)
-        withUnsafeMutablePointer(to: &addr.sun_path) { pathPtr in
-            let pathBuf = UnsafeMutableRawPointer(pathPtr).assumingMemoryBound(to: CChar.self)
-            socketPath.withCString { strncpy(pathBuf, $0, 104 - 1) }
-        }
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
 
-        let result = withUnsafePointer(to: &addr) { ptr in
-            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockPtr in
-                connect(fd, sockPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+        process.terminationHandler = { [weak self] proc in
+            NSLog("[MotionEngine] Helper exited with status %d", proc.terminationStatus)
+            DispatchQueue.main.async {
+                self?.isDetecting = false
+                self?.daemonStatus = "Helper stopped"
             }
         }
 
-        guard result == 0 else {
-            close(fd)
-            return false
+        do {
+            try process.run()
+        } catch {
+            NSLog("[MotionEngine] Failed to launch helper: %@", error.localizedDescription)
+            DispatchQueue.main.async {
+                self.daemonStatus = "Launch failed"
+            }
+            return
         }
 
-        socketFD = fd
-        NSLog("[MotionEngine] Connected to daemon at %@", socketPath)
-        return true
-    }
+        helperProcess = process
 
-    private func startReading(settings: SettingsManager) {
-        isRunning = true
-
-        DispatchQueue.main.async {
-            self.isDetecting = true
-            self.detectionMethod = "Accelerometer"
-            self.daemonStatus = "Connected"
+        // Log stderr from helper
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
+                for line in text.split(separator: "\n") {
+                    NSLog("[SlapHelper] %@", String(line))
+                }
+            }
         }
 
-        // Read from socket in background thread
+        // Read stdout for events
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
-            guard let self else { return }
-
-            var buffer = [UInt8](repeating: 0, count: 4096)
+            let handle = stdoutPipe.fileHandleForReading
             var lineBuffer = ""
 
-            while self.isRunning && self.socketFD >= 0 {
-                let bytesRead = read(self.socketFD, &buffer, buffer.count)
-                if bytesRead <= 0 {
-                    NSLog("[MotionEngine] Daemon disconnected")
-                    DispatchQueue.main.async {
-                        self.isDetecting = false
-                        self.daemonStatus = "Disconnected"
-                    }
-                    break
-                }
+            while true {
+                let data = handle.availableData
+                if data.isEmpty { break } // EOF — helper exited
 
-                lineBuffer += String(bytes: buffer[0..<bytesRead], encoding: .utf8) ?? ""
+                lineBuffer += String(data: data, encoding: .utf8) ?? ""
 
-                // Process complete lines
                 while let newlineIdx = lineBuffer.firstIndex(of: "\n") {
                     let line = String(lineBuffer[lineBuffer.startIndex..<newlineIdx])
                     lineBuffer = String(lineBuffer[lineBuffer.index(after: newlineIdx)...])
 
-                    self.processEvent(line)
+                    if line == "READY" {
+                        NSLog("[MotionEngine] Helper is ready — accelerometer active")
+                        DispatchQueue.main.async {
+                            self?.isDetecting = true
+                            self?.detectionMethod = "Accelerometer"
+                            self?.daemonStatus = "Active"
+                        }
+                    } else {
+                        self?.processEvent(line)
+                    }
                 }
             }
         }
@@ -176,68 +157,19 @@ final class MotionEngine: ObservableObject {
             self?.forceEvent.send(event)
             self?.resetComboAfterDelay()
 
-            // Decay force display
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
                 self?.currentForce = 0
             }
         }
     }
 
-    // MARK: - Launch Daemon
+    // MARK: - Find Helper
 
-    private func launchDaemon(completion: @escaping (Bool) -> Void) {
-        // Find the daemon binary — it's bundled next to the app binary
-        let daemonPath = findDaemonPath()
-
-        guard let path = daemonPath else {
-            NSLog("[MotionEngine] SlapMeDaemon binary not found")
-            completion(false)
-            return
-        }
-
-        NSLog("[MotionEngine] Launching daemon: %@", path)
-
-        // Use osascript to get admin privileges
-        let script = "do shell script \"\\\"\(path)\\\" &\" with administrator privileges"
-
-        DispatchQueue.global().async {
-            let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            task.arguments = ["-e", script]
-
-            do {
-                try task.run()
-                task.waitUntilExit()
-                let success = task.terminationStatus == 0
-                DispatchQueue.main.async { completion(success) }
-            } catch {
-                NSLog("[MotionEngine] osascript error: %@", error.localizedDescription)
-                DispatchQueue.main.async { completion(false) }
-            }
-        }
-    }
-
-    private func findDaemonPath() -> String? {
-        // Check next to the app executable
+    private func findHelperPath() -> String? {
         if let exec = Bundle.main.executableURL {
             let sameDir = exec.deletingLastPathComponent().appendingPathComponent("SlapMeDaemon")
             if FileManager.default.fileExists(atPath: sameDir.path) { return sameDir.path }
-
-            // In Contents/MacOS/
-            let macosDir = exec.deletingLastPathComponent().appendingPathComponent("SlapMeDaemon")
-            if FileManager.default.fileExists(atPath: macosDir.path) { return macosDir.path }
-
-            // In Contents/Helpers/
-            let helpersDir = exec.deletingLastPathComponent().deletingLastPathComponent()
-                .appendingPathComponent("Helpers/SlapMeDaemon")
-            if FileManager.default.fileExists(atPath: helpersDir.path) { return helpersDir.path }
         }
-
-        // SPM build directory
-        let buildPath = Bundle.main.executableURL?.deletingLastPathComponent()
-            .appendingPathComponent("SlapMeDaemon")
-        if let p = buildPath, FileManager.default.fileExists(atPath: p.path) { return p.path }
-
         return nil
     }
 

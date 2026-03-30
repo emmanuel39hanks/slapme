@@ -2,28 +2,31 @@ import SwiftUI
 import AppKit
 
 /// Shows a floating overlay window with a random phrase when a slap is detected.
+/// Reuses a single window to avoid NSHostingView layout crashes during rapid updates.
 final class SlapOverlayManager {
     static let shared = SlapOverlayManager()
 
     private var overlayWindow: NSWindow?
+    private var hostingView: NSHostingView<SlapBubbleView>?
+    private var dismissWorkItem: DispatchWorkItem?
 
     private let phrases = [
         "Don't slap me like that!",
-        "OUCH! 😫",
+        "OUCH!",
         "Hey! Watch it!",
         "That actually hurt!",
-        "Do it again 😏",
+        "Do it again",
         "Is that all you got?",
         "HARDER!",
         "Why would you do that?!",
-        "I felt that one 💀",
+        "I felt that one",
         "My CPU is tingling",
-        "Bro chill 😭",
+        "Bro chill",
         "NOT THE SCREEN!",
         "I'm telling Apple",
         "You call that a slap?",
         "OK I deserved that",
-        "VIOLATION! 🚨",
+        "VIOLATION!",
         "Emotional damage!",
     ]
 
@@ -31,44 +34,56 @@ final class SlapOverlayManager {
 
     func showSlap(force: Double) {
         DispatchQueue.main.async { [self] in
-            // Dismiss any existing overlay
-            overlayWindow?.orderOut(nil)
-
-            guard let screen = NSScreen.main else { return }
+            // Cancel any pending dismiss
+            dismissWorkItem?.cancel()
 
             let phrase = phrases.randomElement()!
             let emoji = emojis.randomElement()!
 
-            // Create overlay content
-            let hostingView = NSHostingView(
-                rootView: SlapBubbleView(emoji: emoji, phrase: phrase, force: force)
-            )
+            guard let screen = NSScreen.main else { return }
 
-            let width: CGFloat = 300
-            let height: CGFloat = 120
+            let view = SlapBubbleView(emoji: emoji, phrase: phrase, force: force)
 
-            // Position: center-top of screen
-            let x = screen.frame.midX - width / 2
-            let y = screen.frame.maxY - 200
+            if let window = overlayWindow, let hosting = hostingView {
+                // Reuse existing window — just update content
+                window.alphaValue = 1
+                hosting.rootView = view
 
-            let window = NSWindow(
-                contentRect: NSRect(x: x, y: y, width: width, height: height),
-                styleMask: .borderless,
-                backing: .buffered,
-                defer: false
-            )
-            window.level = .floating
-            window.backgroundColor = .clear
-            window.isOpaque = false
-            window.ignoresMouseEvents = true
-            window.hasShadow = false
-            window.contentView = hostingView
-            window.orderFront(nil)
+                // Re-fit window to content
+                let size = hosting.fittingSize
+                let x = screen.frame.midX - size.width / 2
+                let y = screen.frame.maxY - 200
+                window.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+                window.orderFront(nil)
+            } else {
+                // First time — create window
+                let hosting = NSHostingView(rootView: view)
+                let size = hosting.fittingSize
 
-            overlayWindow = window
+                let x = screen.frame.midX - size.width / 2
+                let y = screen.frame.maxY - 200
 
-            // Animate out after delay
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) {
+                let window = NSWindow(
+                    contentRect: NSRect(x: x, y: y, width: size.width, height: size.height),
+                    styleMask: .borderless,
+                    backing: .buffered,
+                    defer: false
+                )
+                window.level = .floating
+                window.backgroundColor = .clear
+                window.isOpaque = false
+                window.ignoresMouseEvents = true
+                window.hasShadow = false
+                window.contentView = hosting
+                window.orderFront(nil)
+
+                overlayWindow = window
+                hostingView = hosting
+            }
+
+            // Schedule dismiss
+            let work = DispatchWorkItem { [weak self] in
+                guard let window = self?.overlayWindow else { return }
                 NSAnimationContext.runAnimationGroup({ context in
                     context.duration = 0.4
                     window.animator().alphaValue = 0
@@ -76,6 +91,8 @@ final class SlapOverlayManager {
                     window.orderOut(nil)
                 })
             }
+            dismissWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: work)
         }
     }
 }
@@ -85,18 +102,16 @@ struct SlapBubbleView: View {
     let phrase: String
     let force: Double
 
-    @State private var appear = false
-
     var body: some View {
         VStack(spacing: 8) {
             Text(emoji)
                 .font(.system(size: 40))
-                .scaleEffect(appear ? 1.0 : 0.3)
 
             Text(phrase)
                 .font(.system(size: 15, weight: .bold, design: .rounded))
                 .foregroundColor(.white)
                 .multilineTextAlignment(.center)
+                .fixedSize(horizontal: true, vertical: true)
                 .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
         }
         .padding(.horizontal, 24)
@@ -106,13 +121,5 @@ struct SlapBubbleView: View {
                 .fill(.black.opacity(0.8))
                 .shadow(color: .black.opacity(0.2), radius: 20, y: 10)
         )
-        .scaleEffect(appear ? 1.0 : 0.5)
-        .opacity(appear ? 1.0 : 0)
-        .offset(y: appear ? 0 : 20)
-        .onAppear {
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.6)) {
-                appear = true
-            }
-        }
     }
 }
