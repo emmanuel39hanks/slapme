@@ -57,7 +57,12 @@ final class ReactionEngine: ObservableObject {
     // MARK: - Event Handling
 
     private func handleForceEvent(_ event: MotionEngine.ForceEvent) {
-        guard settings.isEnabled else { return }
+        guard settings.isEnabled else {
+            NSLog("[ReactionEngine] Disabled, ignoring event")
+            return
+        }
+
+        NSLog("[ReactionEngine] Force event: %.2f (%@) → playing sound", event.force, event.category.rawValue)
 
         // Determine visual effect based on force
         let visual = mapForceToVisual(event.force, category: event.category)
