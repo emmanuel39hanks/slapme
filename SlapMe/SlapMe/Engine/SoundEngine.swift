@@ -62,16 +62,21 @@ final class SoundEngine: ObservableObject {
         scanAvailablePacks()
     }
 
+    private var engineFormat: AVAudioFormat!
+
     private func setupAudioEngine() {
         let mainMixer = audioEngine.mainMixerNode
         let output = audioEngine.outputNode
-        let format = output.inputFormat(forBus: 0)
+
+        // Use a standard stereo format for all connections and buffers
+        engineFormat = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 2)
+            ?? output.inputFormat(forBus: 0)
 
         // Create player node pool for concurrent playback
         for _ in 0..<maxConcurrentPlayers {
             let player = AVAudioPlayerNode()
             audioEngine.attach(player)
-            audioEngine.connect(player, to: mainMixer, format: format)
+            audioEngine.connect(player, to: mainMixer, format: engineFormat)
             playerNodes.append(player)
         }
 
@@ -169,12 +174,10 @@ final class SoundEngine: ObservableObject {
     }
 
     private func preloadDefaultSounds() {
-        // Generate simple synthesized sounds as fallback
-        let format = AVAudioFormat(standardFormatWithSampleRate: 44100, channels: 1)!
-
+        // Generate synthesized sounds matching the engine format (stereo)
         for range in ForceRange.allCases {
             let buffer = generateToneBuffer(
-                format: format,
+                format: engineFormat,
                 frequency: range == .soft ? 440 : range == .medium ? 660 : 880,
                 duration: range == .soft ? 0.1 : range == .medium ? 0.2 : 0.3,
                 amplitude: range == .soft ? 0.3 : range == .medium ? 0.6 : 1.0
@@ -188,18 +191,45 @@ final class SoundEngine: ObservableObject {
     private func loadBuffer(from url: URL) -> AVAudioPCMBuffer? {
         guard let audioFile = try? AVAudioFile(forReading: url) else { return nil }
 
-        let frameCount = AVAudioFrameCount(audioFile.length)
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) else {
+        // If file format matches engine format, load directly
+        if audioFile.processingFormat.channelCount == engineFormat.channelCount
+            && audioFile.processingFormat.sampleRate == engineFormat.sampleRate {
+            let frameCount = AVAudioFrameCount(audioFile.length)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: frameCount) else {
+                return nil
+            }
+            do {
+                try audioFile.read(into: buffer)
+                return buffer
+            } catch {
+                return nil
+            }
+        }
+
+        // Convert to engine format
+        guard let converter = AVAudioConverter(from: audioFile.processingFormat, to: engineFormat) else {
+            return nil
+        }
+        let ratio = engineFormat.sampleRate / audioFile.processingFormat.sampleRate
+        let outputFrameCount = AVAudioFrameCount(Double(audioFile.length) * ratio)
+        guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: engineFormat, frameCapacity: outputFrameCount) else {
             return nil
         }
 
+        let inputBuffer = AVAudioPCMBuffer(pcmFormat: audioFile.processingFormat, frameCapacity: AVAudioFrameCount(audioFile.length))!
         do {
-            try audioFile.read(into: buffer)
-            return buffer
+            try audioFile.read(into: inputBuffer)
         } catch {
-            print("[SoundEngine] Failed to load \(url.lastPathComponent): \(error)")
             return nil
         }
+
+        var error: NSError?
+        converter.convert(to: outputBuffer, error: &error) { _, outStatus in
+            outStatus.pointee = .haveData
+            return inputBuffer
+        }
+
+        return error == nil ? outputBuffer : nil
     }
 
     private func generateToneBuffer(
@@ -213,13 +243,17 @@ final class SoundEngine: ObservableObject {
         guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
         buffer.frameLength = frameCount
 
-        guard let channelData = buffer.floatChannelData?[0] else { return nil }
+        guard let channelData = buffer.floatChannelData else { return nil }
+        let channelCount = Int(format.channelCount)
 
         for frame in 0..<Int(frameCount) {
             let t = Double(frame) / sampleRate
-            // Sine wave with exponential decay envelope
             let envelope = exp(-t * 10.0)
-            channelData[frame] = Float(sin(2.0 * .pi * frequency * t) * amplitude * envelope)
+            let sample = Float(sin(2.0 * .pi * frequency * t) * amplitude * envelope)
+            // Write to all channels (mono or stereo)
+            for ch in 0..<channelCount {
+                channelData[ch][frame] = sample
+            }
         }
 
         return buffer

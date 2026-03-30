@@ -19,6 +19,9 @@ web/node_modules/
 web/.next/
 web/out/
 
+# Release build artifacts
+release/
+
 # Env
 .env
 .env.local

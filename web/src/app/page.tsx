@@ -15,9 +15,9 @@ export default function Home() {
         <div className="relative mx-auto w-full max-w-3xl text-center">
           <FadeIn>
             <img
-              src="/mascot.svg"
-              alt="SlapMe mascot"
-              className="mx-auto mb-8 h-28 w-28 sm:h-32 sm:w-32"
+              src="/slap-hero.gif"
+              alt="Slapping a laptop"
+              className="mx-auto mb-8 h-40 w-auto rounded-2xl sm:h-48"
               draggable={false}
             />
           </FadeIn>
@@ -40,7 +40,8 @@ export default function Home() {
           <FadeIn delay={0.15}>
             <div className="mt-10 flex items-center justify-center gap-4">
               <a
-                href="#"
+                href="/SlapMe.zip"
+                download
                 className="inline-flex items-center gap-2.5 rounded-full bg-gray-950 px-6 py-3 text-sm font-medium text-white transition-all duration-200 hover:-translate-y-px hover:bg-gray-800 hover:shadow-lg active:translate-y-0"
               >
                 <svg
