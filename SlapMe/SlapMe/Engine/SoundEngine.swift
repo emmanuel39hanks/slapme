@@ -1,8 +1,9 @@
 import Foundation
-import AVFoundation
+import AppKit
 import Combine
 
-/// Simple sound engine using AVAudioPlayer. No format conversion needed.
+/// Sound engine using NSSound — immune to AVAudioEngine conflicts,
+/// works with hardened runtime, no format conversion needed.
 final class SoundEngine: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var availableSounds: [SoundItem] = []
@@ -12,7 +13,7 @@ final class SoundEngine: ObservableObject {
         }
     }
 
-    private var player: AVAudioPlayer?
+    private var currentSound: NSSound?
 
     struct SoundItem: Identifiable, Hashable {
         let id: String
@@ -20,7 +21,7 @@ final class SoundEngine: ObservableObject {
         let path: URL
     }
 
-    // Compat stubs for ReactionEngine
+    // Compat stubs
     struct SoundPackMeta: Identifiable { let id: String; let name: String; let author: String; let description: String; let path: URL }
     var availablePacks: [SoundPackMeta] { [] }
     enum ForceRange: String, CaseIterable { case soft, medium, hard }
@@ -30,43 +31,45 @@ final class SoundEngine: ObservableObject {
         selectedSound = UserDefaults.standard.string(forKey: "selectedSound") ?? ""
     }
 
-    // MARK: - Scan
+    // MARK: - Scan (no Bundle.module — search explicitly)
 
     func scanSounds() {
         var items: [SoundItem] = []
         let bundleName = "SlapMe_SlapMe.bundle"
         let subPath = "SoundPacks/default"
 
+        // Build all candidate paths — order matters, first match wins
         var searchPaths: [URL] = []
 
-        // SPM build: Bundle.module
-        if let p = Bundle.module.resourceURL?.appendingPathComponent(subPath) {
-            searchPaths.append(p)
+        // 1. .app bundle: Contents/Resources/<bundle>/SoundPacks/default
+        //    This is where Bundle.main.resourceURL points in a proper .app
+        if let resURL = Bundle.main.resourceURL {
+            searchPaths.append(resURL.appendingPathComponent("\(bundleName)/\(subPath)"))
+            searchPaths.append(resURL.appendingPathComponent(subPath))
         }
 
-        // .app bundle: Contents/Resources/<bundle>/
+        // 2. Relative to executable (Contents/MacOS → Contents/Resources)
         if let exec = Bundle.main.executableURL {
-            let contentsDir = exec.deletingLastPathComponent().deletingLastPathComponent()
-            searchPaths.append(contentsDir.appendingPathComponent("Resources/\(bundleName)/\(subPath)"))
+            let contents = exec.deletingLastPathComponent().deletingLastPathComponent()
+            searchPaths.append(contents.appendingPathComponent("Resources/\(bundleName)/\(subPath)"))
         }
 
-        // Main bundle resource URL
-        if let p = Bundle.main.resourceURL?.appendingPathComponent("\(bundleName)/\(subPath)") {
-            searchPaths.append(p)
+        // 3. Next to the executable (SPM swift build puts bundle here)
+        if let exec = Bundle.main.executableURL {
+            searchPaths.append(exec.deletingLastPathComponent().appendingPathComponent("\(bundleName)/\(subPath)"))
         }
 
-        // App root
+        // 4. Bundle.main root (fallback)
         searchPaths.append(Bundle.main.bundleURL.appendingPathComponent("\(bundleName)/\(subPath)"))
 
-        // User's Application Support
+        // 5. User's Application Support
         if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
             searchPaths.append(appSupport.appendingPathComponent("SlapMe/\(subPath)"))
         }
 
         for basePath in searchPaths {
-            guard FileManager.default.fileExists(atPath: basePath.path),
-                  let files = try? FileManager.default.contentsOfDirectory(at: basePath, includingPropertiesForKeys: nil)
-            else { continue }
+            guard FileManager.default.fileExists(atPath: basePath.path) else { continue }
+            guard let files = try? FileManager.default.contentsOfDirectory(at: basePath, includingPropertiesForKeys: nil) else { continue }
 
             NSLog("[SoundEngine] Found sounds at: %@", basePath.path)
 
@@ -95,48 +98,50 @@ final class SoundEngine: ObservableObject {
     }
 
     func preloadCurrentPack(settings: SettingsManager) {
-        // compat — sounds are loaded on play
+        // no-op — NSSound loads on play
     }
 
-    // MARK: - Play
+    // MARK: - Playback via NSSound
 
-    /// Play the currently selected sound
     func playSelected(volume: Float = 1.0) {
         guard let item = availableSounds.first(where: { $0.id == selectedSound }) else {
-            NSLog("[SoundEngine] No sound selected")
+            NSLog("[SoundEngine] No sound selected, available: %@", availableSounds.map(\.id).joined(separator: ", "))
             return
         }
         playFile(url: item.path, volume: volume)
     }
 
-    /// Play a specific sound by ID
     func playSound(id: String, volume: Float = 1.0) {
-        guard let item = availableSounds.first(where: { $0.id == id }) else { return }
+        guard let item = availableSounds.first(where: { $0.id == id }) else {
+            NSLog("[SoundEngine] Sound '%@' not found", id)
+            return
+        }
         playFile(url: item.path, volume: volume)
     }
 
     private func playFile(url: URL, volume: Float) {
-        do {
-            player?.stop()
-            player = try AVAudioPlayer(contentsOf: url)
-            player?.volume = volume
-            player?.prepareToPlay()
-            player?.play()
+        // Stop current
+        currentSound?.stop()
 
-            DispatchQueue.main.async { self.isPlaying = true }
+        // NSSound — works regardless of AVAudioEngine state, no entitlements needed for output
+        guard let sound = NSSound(contentsOf: url, byReference: false) else {
+            NSLog("[SoundEngine] FAILED to load: %@", url.path)
+            return
+        }
 
-            let duration = player?.duration ?? 1.0
-            DispatchQueue.main.asyncAfter(deadline: .now() + duration) { [weak self] in
-                self?.isPlaying = false
-            }
+        sound.volume = volume
+        sound.play()
+        currentSound = sound
 
-            NSLog("[SoundEngine] Playing: %@", url.lastPathComponent)
-        } catch {
-            NSLog("[SoundEngine] ERROR playing %@: %@", url.lastPathComponent, error.localizedDescription)
+        NSLog("[SoundEngine] Playing: %@", url.lastPathComponent)
+
+        DispatchQueue.main.async { self.isPlaying = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + sound.duration) { [weak self] in
+            self?.isPlaying = false
         }
     }
 
-    // Legacy API for ReactionEngine
+    // Legacy API
     func play(force: Double, volumeScale: Double) {
         playSelected(volume: Float(volumeScale))
     }
