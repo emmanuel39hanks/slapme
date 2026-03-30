@@ -86,16 +86,45 @@ final class SoundEngine: ObservableObject {
     func scanSounds() {
         var items: [SoundItem] = []
 
-        // Find all mp3/wav files in the default sound pack
-        let searchPaths: [URL?] = [
-            Bundle.module.resourceURL?.appendingPathComponent("SoundPacks/default"),
-            Bundle.main.resourceURL?.appendingPathComponent("SoundPacks/default"),
-        ]
+        // Search everywhere the resource bundle could be
+        let bundleName = "SlapMe_SlapMe.bundle"
+        let subPath = "SoundPacks/default"
 
-        for basePath in searchPaths.compactMap({ $0 }) {
+        var searchPaths: [URL] = []
+
+        // 1. Bundle.module (works when running from swift build)
+        if let p = Bundle.module.resourceURL?.appendingPathComponent(subPath) { searchPaths.append(p) }
+
+        // 2. Inside .app/Contents/Resources/<bundle>/
+        if let p = Bundle.main.resourceURL?.appendingPathComponent("\(bundleName)/\(subPath)") { searchPaths.append(p) }
+
+        // 3. Next to executable (swift build)
+        let execURL = Bundle.main.executableURL?.deletingLastPathComponent()
+        if let p = execURL?.appendingPathComponent("\(bundleName)/\(subPath)") { searchPaths.append(p) }
+
+        // 3b. Contents/Resources from Contents/MacOS (proper .app bundle)
+        if let p = execURL?.deletingLastPathComponent()
+            .appendingPathComponent("Resources/\(bundleName)/\(subPath)") { searchPaths.append(p) }
+
+        // 4. .app root (fallback)
+        let appRoot = Bundle.main.bundleURL.appendingPathComponent("\(bundleName)/\(subPath)")
+        searchPaths.append(appRoot)
+
+        // 5. Direct in Resources
+        if let p = Bundle.main.resourceURL?.appendingPathComponent(subPath) { searchPaths.append(p) }
+
+        // 6. User's Application Support
+        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            searchPaths.append(appSupport.appendingPathComponent("SlapMe/\(subPath)"))
+        }
+
+        for basePath in searchPaths {
+            guard FileManager.default.fileExists(atPath: basePath.path) else { continue }
             guard let files = try? FileManager.default.contentsOfDirectory(
                 at: basePath, includingPropertiesForKeys: nil
             ) else { continue }
+
+            print("[SoundEngine] Scanning: \(basePath.path)")
 
             for file in files {
                 let ext = file.pathExtension.lowercased()
@@ -110,13 +139,14 @@ final class SoundEngine: ObservableObject {
                     items.append(SoundItem(id: filename, name: displayName, path: file))
                 }
             }
+
+            if !items.isEmpty { break }  // Found sounds, stop searching
         }
 
         print("[SoundEngine] Found \(items.count) sounds: \(items.map(\.name))")
 
         DispatchQueue.main.async {
             self.availableSounds = items
-            // Auto-select first sound if none selected
             if self.selectedSound.isEmpty, let first = items.first {
                 self.selectedSound = first.id
             }
