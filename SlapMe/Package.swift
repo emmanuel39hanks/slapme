@@ -13,7 +13,8 @@ let package = Package(
             name: "SlapMe",
             path: "SlapMe",
             resources: [
-                .copy("Resources/SoundPacks")
+                .copy("Resources/SoundPacks"),
+                .copy("Resources/Gifs")
             ]
         ),
         .executableTarget(

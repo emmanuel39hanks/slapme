@@ -1,14 +1,18 @@
 import SwiftUI
 import AppKit
 
-/// Shows a floating overlay window with a random phrase when a slap is detected.
+/// Shows a floating overlay window with an animated GIF reaction when a slap is detected.
 /// Reuses a single window to avoid NSHostingView layout crashes during rapid updates.
 final class SlapOverlayManager {
     static let shared = SlapOverlayManager()
 
     private var overlayWindow: NSWindow?
-    private var hostingView: NSHostingView<SlapBubbleView>?
+    private var gifView: NSImageView?
+    private var labelField: NSTextField?
+    private var containerView: NSView?
     private var dismissWorkItem: DispatchWorkItem?
+
+    private var gifImages: [NSImage] = []
 
     private let phrases = [
         "Don't slap me like that!",
@@ -30,41 +34,75 @@ final class SlapOverlayManager {
         "Emotional damage!",
     ]
 
-    private let emojis = ["👋", "💥", "😮", "🫣", "😤", "🤯", "💀", "🔥", "⚡️", "😭"]
+    init() {
+        loadGifs()
+    }
+
+    private func loadGifs() {
+        var searchPaths: [URL] = []
+
+        // .app bundle: Contents/Resources/Gifs/
+        if let resURL = Bundle.main.resourceURL {
+            let gifsURL = resURL.appendingPathComponent("Gifs")
+            searchPaths.append(gifsURL)
+            NSLog("[SlapOverlay] Searching for GIFs in: %@", gifsURL.path)
+        }
+
+        // SPM bundle: SlapMe_SlapMe.bundle/Gifs/
+        if let spmURL = Bundle.module.resourceURL {
+            searchPaths.append(spmURL.appendingPathComponent("Gifs"))
+        }
+
+        for dir in searchPaths {
+            guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir.path) else { continue }
+            for file in files where file.hasSuffix(".gif") {
+                let fullPath = dir.appendingPathComponent(file).path
+                if let image = NSImage(contentsOfFile: fullPath) {
+                    gifImages.append(image)
+                    NSLog("[SlapOverlay] Loaded GIF: %@", file)
+                }
+            }
+            if !gifImages.isEmpty { break }
+        }
+
+        NSLog("[SlapOverlay] Total GIFs loaded: %d", gifImages.count)
+    }
 
     func showSlap(force: Double) {
         DispatchQueue.main.async { [self] in
-            // Cancel any pending dismiss
             dismissWorkItem?.cancel()
-
-            let phrase = phrases.randomElement()!
-            let emoji = emojis.randomElement()!
 
             guard let screen = NSScreen.main else { return }
 
-            let view = SlapBubbleView(emoji: emoji, phrase: phrase, force: force)
+            let phrase = phrases.randomElement()!
+            let gif = gifImages.randomElement()
 
-            if let window = overlayWindow, let hosting = hostingView {
-                // Reuse existing window — just update content
+            let gifSize: CGFloat = 150
+            let windowWidth: CGFloat = 320
+            let windowHeight: CGFloat = gif != nil ? 240 : 100
+
+            if let window = overlayWindow {
+                // Reuse window
                 window.alphaValue = 1
-                hosting.rootView = view
 
-                // Re-fit window to content
-                let size = hosting.fittingSize
-                let x = screen.frame.midX - size.width / 2
-                let y = screen.frame.maxY - 200
-                window.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+                if let gv = gifView {
+                    gv.image = gif
+                    gv.animates = true
+                    gv.isHidden = gif == nil
+                }
+                labelField?.stringValue = phrase
+
+                let x = screen.frame.midX - windowWidth / 2
+                let y = screen.frame.maxY - 280
+                window.setFrame(NSRect(x: x, y: y, width: windowWidth, height: windowHeight), display: true)
                 window.orderFront(nil)
             } else {
-                // First time — create window
-                let hosting = NSHostingView(rootView: view)
-                let size = hosting.fittingSize
-
-                let x = screen.frame.midX - size.width / 2
-                let y = screen.frame.maxY - 200
+                // Create window + views
+                let x = screen.frame.midX - windowWidth / 2
+                let y = screen.frame.maxY - 280
 
                 let window = NSWindow(
-                    contentRect: NSRect(x: x, y: y, width: size.width, height: size.height),
+                    contentRect: NSRect(x: x, y: y, width: windowWidth, height: windowHeight),
                     styleMask: .borderless,
                     backing: .buffered,
                     defer: false
@@ -74,11 +112,49 @@ final class SlapOverlayManager {
                 window.isOpaque = false
                 window.ignoresMouseEvents = true
                 window.hasShadow = false
-                window.contentView = hosting
+
+                // Container with rounded background
+                let container = NSView(frame: NSRect(x: 0, y: 0, width: windowWidth, height: windowHeight))
+                container.wantsLayer = true
+                container.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor
+                container.layer?.cornerRadius = 20
+                container.layer?.masksToBounds = true
+
+                // GIF view
+                let imageView = NSImageView(frame: NSRect(
+                    x: (windowWidth - gifSize) / 2,
+                    y: windowHeight - gifSize - 16,
+                    width: gifSize,
+                    height: gifSize
+                ))
+                imageView.imageScaling = .scaleProportionallyUpOrDown
+                imageView.animates = true
+                imageView.image = gif
+                imageView.isHidden = gif == nil
+                imageView.wantsLayer = true
+                imageView.layer?.cornerRadius = 12
+                imageView.layer?.masksToBounds = true
+                container.addSubview(imageView)
+
+                // Text label
+                let label = NSTextField(labelWithString: phrase)
+                label.font = NSFont.systemFont(ofSize: 15, weight: .bold)
+                label.textColor = .white
+                label.alignment = .center
+                label.backgroundColor = .clear
+                label.isBezeled = false
+                label.isEditable = false
+                let labelY: CGFloat = gif != nil ? 12 : (windowHeight - 30) / 2
+                label.frame = NSRect(x: 16, y: labelY, width: windowWidth - 32, height: 30)
+                container.addSubview(label)
+
+                window.contentView = container
                 window.orderFront(nil)
 
                 overlayWindow = window
-                hostingView = hosting
+                gifView = imageView
+                labelField = label
+                containerView = container
             }
 
             // Schedule dismiss
@@ -89,37 +165,11 @@ final class SlapOverlayManager {
                     window.animator().alphaValue = 0
                 }, completionHandler: {
                     window.orderOut(nil)
+                    self?.gifView?.animates = false
                 })
             }
             dismissWorkItem = work
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: work)
         }
-    }
-}
-
-struct SlapBubbleView: View {
-    let emoji: String
-    let phrase: String
-    let force: Double
-
-    var body: some View {
-        VStack(spacing: 8) {
-            Text(emoji)
-                .font(.system(size: 40))
-
-            Text(phrase)
-                .font(.system(size: 15, weight: .bold, design: .rounded))
-                .foregroundColor(.white)
-                .multilineTextAlignment(.center)
-                .fixedSize(horizontal: true, vertical: true)
-                .shadow(color: .black.opacity(0.3), radius: 2, y: 1)
-        }
-        .padding(.horizontal, 24)
-        .padding(.vertical, 16)
-        .background(
-            RoundedRectangle(cornerRadius: 20)
-                .fill(.black.opacity(0.8))
-                .shadow(color: .black.opacity(0.2), radius: 20, y: 10)
-        )
     }
 }
